@@ -3,12 +3,16 @@ import path from "node:path";
 import {
   createGit,
   getLatestDiff,
-  saveLastProcessedCommit,
+  updateLocalRepositoryA,
   getRepoRoot,
 } from "./gitUtils.js";
 import { runCustomFunction } from "./runCustomFunction.js";
 
-const repoAPath = path.resolve(process.cwd(), process.env.REPO_A_PATH);
+// Handle both absolute and relative paths for REPO_A_PATH
+const repoAPathRaw = process.env.REPO_A_PATH;
+const repoAPath = path.isAbsolute(repoAPathRaw) 
+  ? repoAPathRaw 
+  : path.resolve(process.cwd(), repoAPathRaw);
 const repoABranch = process.env.REPO_A_BRANCH || "main";
 
 // Validate required environment variables
@@ -43,16 +47,21 @@ const updateRepository = async () => {
       console.log(`Repo Root: ${repoRoot}`);
     }
 
-    const { diff, latestCommit } = await getLatestDiff(git, repoABranch);
+    const { diff, latestCommit, localCommit } = await getLatestDiff(git, repoABranch);
 
     if (!latestCommit) {
-      console.log("⚠️ Could not determine latest commit");
+      console.log("⚠️ Could not determine latest commit from remote");
       return;
     }
 
+    if (localCommit) {
+      console.log(`Local A commit: ${localCommit.substring(0, 7)}`);
+    }
+    console.log(`Remote A commit: ${latestCommit.substring(0, 7)}`);
+
     if (diff && diff.trim().length > 0) {
       console.log(
-        `✅ Differences found (commit: ${latestCommit.substring(0, 7)})`
+        `✅ Differences found between local and remote A`
       );
       console.log("→ Running Smart PR logic...");
 
@@ -61,21 +70,30 @@ const updateRepository = async () => {
       if (result.success) {
         if (result.prUrl) {
           console.log(`\n🎉 Smart PR created successfully: ${result.prUrl}`);
+          
+          // After successful PR creation, update local Repository A
+          // to sync with remote A for next check
+          await updateLocalRepositoryA(git, repoABranch);
         } else {
           console.log("\n✅ Processing completed (no PR needed)");
-        }
-        // Save the processed commit to avoid reprocessing
-        if (result.latestCommit) {
-          await saveLastProcessedCommit(result.latestCommit);
-          console.log(
-            `💾 Saved processed commit: ${result.latestCommit.substring(0, 7)}`
-          );
+          // Even if no PR was created (maybe no changes after merge),
+          // we should still update local A if there were changes in remote
+          if (localCommit !== latestCommit) {
+            await updateLocalRepositoryA(git, repoABranch);
+          }
         }
       } else {
         console.error(`\n❌ Smart PR failed: ${result.reason || result.error}`);
+        // Don't update local A if PR creation failed
       }
     } else {
-      console.log("ℹ️ No new changes detected.");
+      console.log("ℹ️ No new changes detected (local A is up to date with remote A).");
+      
+      // Even if no diff, check if we need to sync
+      if (localCommit !== latestCommit) {
+        console.log("⚠️ Local and remote commits differ but no diff found. Updating local A...");
+        await updateLocalRepositoryA(git, repoABranch);
+      }
     }
   } catch (err) {
     console.error("❌ Error in updateRepository:", err);

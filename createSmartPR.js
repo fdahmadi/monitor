@@ -12,7 +12,15 @@ const client = new Anthropic({
 const runCmd = (cmd, cwd) => {
     return new Promise((resolve, reject) => {
         exec(cmd, { cwd }, (err, stdout, stderr) => {
-            if (err) return reject(stderr || err.message);
+            if (err) {
+                // Better error handling - include both stderr and stdout for debugging
+                const errorMsg = stderr?.trim() || stdout?.trim() || err.message || err.toString();
+                const fullError = new Error(errorMsg);
+                fullError.originalError = err;
+                fullError.stdout = stdout?.trim();
+                fullError.stderr = stderr?.trim();
+                return reject(fullError);
+            }
             resolve(stdout.trim());
         });
     });
@@ -24,77 +32,239 @@ export const getDiffFromA = async () => {
     return runCmd(`git diff HEAD~1 HEAD`, repoPath);
 };
 
+// Extract changed files and their operation types (new, deleted, modified, renamed)
 export const extractChangedFiles = (diffText) => {
-    const files = new Set();
-    const regex = /diff --git a\/(.+?) b\/(.+?)\n/g;
+    const files = new Map(); // Map of file path -> { operation: 'new'|'deleted'|'modified'|'renamed', pathA, pathB }
+    
+    // Regex to match: diff --git a/path b/path
+    // Handles:
+    // - Standard format: diff --git a/file.txt b/file.txt
+    // - New files: diff --git a/dev/null b/newfile.txt
+    // - Deleted files: diff --git a/file.txt b/dev/null
+    // - Quoted paths with spaces: diff --git a/"file name.txt" b/"file name.txt"
+    const regex = /^diff --git (?:a\/([^\s"]+)|a\/"([^"]+)") (?:b\/([^\s"]+)|b\/"([^"]+)")\s*$/gm;
     let match;
+    
     while ((match = regex.exec(diffText)) !== null) {
-        files.add(match[1]);
+        // Extract paths - handle both quoted and unquoted
+        // match[1] = unquoted pathA, match[2] = quoted pathA
+        // match[3] = unquoted pathB, match[4] = quoted pathB
+        const pathA = match[1] || match[2] || '';
+        const pathB = match[3] || match[4] || '';
+        
+        if (!pathA && !pathB) continue; // Skip if we couldn't extract paths
+        
+        // Determine the actual file path and operation type
+        let actualPath;
+        let operation;
+        
+        if (pathA === '/dev/null' || pathA === 'null' || !pathA) {
+            // New file (created in A)
+            actualPath = pathB;
+            operation = 'new';
+        } else if (pathB === '/dev/null' || pathB === 'null' || !pathB) {
+            // Deleted file
+            actualPath = pathA;
+            operation = 'deleted';
+        } else if (pathA !== pathB) {
+            // Renamed or moved file (different paths)
+            actualPath = pathB; // Use destination path
+            operation = 'renamed';
+        } else {
+            // Modified file (same path)
+            actualPath = pathB;
+            operation = 'modified';
+        }
+        
+        files.set(actualPath, { operation, pathA: pathA || '/dev/null', pathB: pathB || '/dev/null' });
     }
-    return Array.from(files);
+    
+    return files;
 };
 
-export const readFilesFromB = async (files) => {
+// Read files from repository B
+export const readFilesFromB = async (filesMap) => {
     const repoB = process.env.REPO_B_PATH;
     const result = {};
 
-    for (const file of files) {
-        const filePath = path.join(repoB, file);
+    for (const [filePath, fileInfo] of filesMap.entries()) {
+        const fullPath = path.join(repoB, filePath);
         try {
-            const content = await readFile(filePath, "utf8");
-            result[file] = content;
+            const content = await readFile(fullPath, "utf8");
+            result[filePath] = { content, operation: fileInfo.operation };
         } catch {
-            result[file] = null;
+            // File doesn't exist in B (normal for new files)
+            result[filePath] = { content: null, operation: fileInfo.operation };
         }
     }
     return result;
 };
 
-export const generatePRviaClaude = async (diffText, filesFromB) => {
+// Read files from repository A (especially for new files)
+export const readFilesFromA = async (filesMap) => {
+    const repoA = process.env.REPO_A_PATH;
+    const result = {};
+
+    for (const [filePath, fileInfo] of filesMap.entries()) {
+        // For new files, read from A to get the content
+        if (fileInfo.operation === 'new') {
+            const fullPath = path.join(repoA, filePath);
+            try {
+                const content = await readFile(fullPath, "utf8");
+                result[filePath] = { content, operation: fileInfo.operation };
+            } catch (err) {
+                console.warn(`Could not read new file from A: ${filePath}`, err.message);
+                result[filePath] = { content: null, operation: fileInfo.operation };
+            }
+        } else {
+            // For modified/deleted files, we can optionally read from A too
+            const fullPath = path.join(repoA, filePath);
+            try {
+                const content = await readFile(fullPath, "utf8");
+                result[filePath] = { content, operation: fileInfo.operation };
+            } catch {
+                result[filePath] = { content: null, operation: fileInfo.operation };
+            }
+        }
+    }
+    return result;
+};
+
+export const generatePRviaClaude = async (diffText, filesFromA, filesFromB) => {
     const repoAUrl = process.env.REPO_A_URL;
     const repoBUrl = process.env.REPO_B_URL;
     const model = process.env.CLAUDE_MODEL || "claude-3-5-sonnet-20241022";
 
+    // Build file information section
+    const fileInfoSections = [];
+    for (const filePath of Object.keys(filesFromA)) {
+        const fileA = filesFromA[filePath];
+        const fileB = filesFromB[filePath];
+        const operation = fileA.operation || fileB.operation || 'modified';
+        
+        let section = `
+FILE: ${filePath}
+OPERATION: ${operation}
+`;
+        
+        if (operation === 'new') {
+            section += `-------------
+This is a NEW file created in Repository A.
+
+Content from Repository A:
+${fileA.content || "(could not read file)"}
+
+Current state in Repository B:
+(file does not exist - should be created)
+`;
+        } else if (operation === 'deleted') {
+            section += `-------------
+This file was DELETED in Repository A.
+
+Current state in Repository B:
+${fileB.content || "(file not found in B)"}
+
+Note: Consider whether this file should be deleted in B or kept.
+`;
+        } else {
+            // Modified file
+            section += `-------------
+Content from Repository A (after changes):
+${fileA.content || "(could not read from A)"}
+
+Current state in Repository B:
+${fileB.content || "(file not found in B)"}
+`;
+        }
+        
+        fileInfoSections.push(section);
+    }
+
     const prompt = `
-You are an AI expert in code merging.
+You are an AI expert in code merging and git patch generation.
 
 Repository A URL: ${repoAUrl}
 Repository B URL: ${repoBUrl}
 
-Latest changes in Repository A:
+Latest changes in Repository A (Git Diff):
 -------------------------
 ${diffText}
 
-Current state of relevant files in Repository B:
+Detailed file information:
 -------------------------
-${Object.entries(filesFromB)
-        .map(([name, content]) => `
-FILE: ${name}
--------------
-${content || "(file not found in B)"}
-`)
-        .join("\n\n")}
+${fileInfoSections.join("\n\n")}
 
 Task:
 Generate the best possible Pull Request patch that intelligently merges
 changes from A into B, preserving any custom modifications in B.
 
-IMPORTANT: Return your response in the following EXACT format:
+CRITICAL PATCH FORMAT REQUIREMENTS:
+The patch MUST be a valid unified diff format that can be applied with 'git apply'. 
+Follow these EXACT rules:
+
+1. For MODIFIED files, use this format:
+   diff --git a/path/to/file b/path/to/file
+   index <hash1>..<hash2> <mode>
+   --- a/path/to/file
+   +++ b/path/to/file
+   @@ -<old_start>,<old_lines> +<new_start>,<new_lines> @@
+   <context lines>
+   -<removed lines>
+   +<added lines>
+   <context lines>
+
+2. For NEW files, use this format:
+   diff --git a/dev/null b/path/to/newfile
+   new file mode 100644
+   index 0000000..<hash> <mode>
+   --- /dev/null
+   +++ b/path/to/newfile
+   @@ -0,0 +1,<lines> @@
+   +<file content lines>
+
+3. For DELETED files, use this format:
+   diff --git a/path/to/file b/dev/null
+   deleted file mode 100644
+   index <hash>..0000000 <mode>
+   --- a/path/to/file
+   +++ /dev/null
+   @@ -1,<lines> +0,0 @@
+   -<file content lines>
+
+4. IMPORTANT:
+   - EVERY line of code MUST have a leading '+' or '-' or ' ' (space for context)
+   - Include proper @@ hunk headers with correct line numbers
+   - Include enough context lines (at least 3 lines before and after changes)
+   - The patch MUST be complete and valid - git apply will reject incomplete patches
+
+EXAMPLE of a valid patch for a modified file:
+\`\`\`
+diff --git a/example.js b/example.js
+index abc1234..def5678 100644
+--- a/example.js
++++ b/example.js
+@@ -1,5 +1,6 @@
+ function hello() {
+-  console.log("Hello");
++  console.log("Hello World");
++  console.log("Updated");
+ }
+\`\`\`
+
+Return your response in the following EXACT format:
 ---
 TITLE: [Your PR title here]
 ---
 DESCRIPTION: [Your PR description here]
 ---
 PATCH:
-[Unified git patch format starting with diff --git]
+[Complete valid git unified diff - must be applyable with 'git apply']
 ---
-
-The patch must be a valid unified diff that can be applied with 'git apply'.
 `;
 
     const res = await client.messages.create({
         model,
-        max_tokens: 8192,
+        max_tokens: 16384,
         messages: [{ role: "user", content: prompt }],
     });
 
@@ -106,7 +276,27 @@ export const parseClaudeResponse = (response) => {
     // Try to match the structured format first
     const titleMatch = response.match(/TITLE:\s*(.+?)(?=\n---|\nDESCRIPTION:|$)/s);
     const descMatch = response.match(/DESCRIPTION:\s*(.+?)(?=\n---|\nPATCH:|$)/s);
-    const patchMatch = response.match(/PATCH:\s*([\s\S]+?)(?=\n---|$)/s);
+    
+    // Improved regex to capture patch - look for PATCH: and capture until end or next ---
+    // Also handle cases where PATCH might be in markdown code blocks
+    let patchMatch = response.match(/PATCH:\s*([\s\S]+?)(?=\n---\s*$|\n---\s*\n|$)/s);
+    
+    // If not found, try to find it after DESCRIPTION or in code blocks
+    if (!patchMatch) {
+        // Try to find patch in code blocks
+        const codeBlockMatch = response.match(/```(?:diff|patch|text)?\n([\s\S]+?)```/);
+        if (codeBlockMatch && codeBlockMatch[1].includes('diff --git')) {
+            patchMatch = { 1: codeBlockMatch[1] };
+        }
+    }
+    
+    // If still not found, try finding patch section more flexibly
+    if (!patchMatch) {
+        const patchSectionMatch = response.match(/(?:PATCH|Patch):\s*\n([\s\S]+?)(?=\n\n|\n---|$)/);
+        if (patchSectionMatch) {
+            patchMatch = patchSectionMatch;
+        }
+    }
     
     let title = titleMatch ? titleMatch[1].trim() : "Merge changes from Repository A";
     let description = descMatch ? descMatch[1].trim() : "Automated merge of changes from Repository A using AI.";
@@ -117,7 +307,8 @@ export const parseClaudeResponse = (response) => {
         const lines = response.split('\n');
         let patchStart = -1;
         for (let i = 0; i < lines.length; i++) {
-            if (lines[i].startsWith('diff --git') || lines[i].startsWith('---') && i + 1 < lines.length && lines[i + 1].startsWith('+++')) {
+            if (lines[i].startsWith('diff --git') || 
+                (lines[i].startsWith('---') && i + 1 < lines.length && lines[i + 1].startsWith('+++'))) {
                 patchStart = i;
                 break;
             }
@@ -129,7 +320,16 @@ export const parseClaudeResponse = (response) => {
     
     // Remove markdown code blocks if present
     if (patch) {
+        // Remove code block markers
         patch = patch.replace(/^```[\w]*\n/gm, '').replace(/\n```$/gm, '').trim();
+        patch = patch.replace(/^```[a-z]*/gm, '').replace(/```$/gm, '').trim();
+        // Remove any remaining markdown formatting
+        patch = patch.replace(/^\*\*\*.*\*\*\*\n/gm, '').trim();
+    }
+    
+    // Validate patch has basic structure
+    if (patch && !patch.match(/^diff --git|^---|^Index:|^\*\*\*/m)) {
+        console.warn("⚠️ Warning: Patch format might be invalid - no standard diff markers found");
     }
     
     return { title, description, patch };
@@ -173,17 +373,159 @@ export const createPRonGitHub = async (title, description, patch) => {
         const patchFile = path.join(repoBPath, `temp-patch-${timestamp}.patch`);
         await writeFile(patchFile, patch, "utf8");
         
+        // Log patch preview for debugging
+        console.log(`\n📝 Patch preview (first 500 chars):`);
+        console.log(patch.substring(0, 500) + (patch.length > 500 ? '...' : ''));
+        
+        // Track if patch was applied with rejects (for PR description)
+        let appliedWithRejects = false;
+        
         // Apply patch
         try {
             // Use absolute path and proper escaping for cross-platform compatibility
             const normalizedPath = path.resolve(patchFile).replace(/\\/g, '/');
-            await runCmd(`git apply "${normalizedPath}"`, repoBPath);
+            console.log(`\n🔧 Applying patch: ${normalizedPath}`);
+            
+            // Clean up any existing .rej files first
+            try {
+                await runCmd(`find . -name "*.rej" -delete 2>/dev/null || true`, repoBPath);
+            } catch {}
+            
+            let patchApplied = false;
+            
+            // Strategy 1: Try with 3-way merge (best for when files differ)
+            try {
+                await runCmd(`git apply --3way --ignore-whitespace "${normalizedPath}"`, repoBPath);
+                console.log(`✅ Patch applied successfully with --3way`);
+                patchApplied = true;
+            } catch (apply3wayError) {
+                console.log(`⚠️ 3-way apply failed, trying other methods...`);
+                
+                // Strategy 2: Try with reject (applies what it can, rejects what it can't)
+                // --reject will apply what it can and create .rej files for what it can't
+                // It may exit with error code, so we need to handle that
+                try {
+                    // Try apply with reject - command may exit with error even if partial apply succeeded
+                    const result = await runCmd(`git apply --reject --ignore-whitespace "${normalizedPath}" 2>&1; exit 0`, repoBPath);
+                    // Check result for any useful info
+                    if (result && result.includes('error:')) {
+                        console.log(`Reject strategy had some errors (this is expected if files differ)`);
+                    }
+                } catch (rejectCmdError) {
+                    // Command may fail, but that's OK - check for actual results below
+                    // Even if command fails, partial apply might have succeeded
+                }
+                
+                // Check if any files were actually modified or if we got rejects
+                const statusCheck = await git.status();
+                const hasChanges = statusCheck.files && statusCheck.files.length > 0;
+                
+                let rejectCheck = '';
+                try {
+                    rejectCheck = await runCmd(`find . -name "*.rej" 2>/dev/null || true`, repoBPath);
+                } catch {}
+                const hasRejects = rejectCheck && rejectCheck.trim().length > 0;
+                
+                if (hasChanges || hasRejects) {
+                    if (hasRejects) {
+                        console.log(`⚠️ Patch applied with some rejects (partial apply)`);
+                        console.log(`Rejected parts in: ${rejectCheck.trim()}`);
+                        appliedWithRejects = true;
+                    } else {
+                        console.log(`✅ Patch applied successfully with reject strategy`);
+                    }
+                    patchApplied = true;
+                }
+                
+                // If reject strategy didn't work, try other methods
+                if (!patchApplied) {
+                    console.log(`⚠️ Reject strategy found no changes. Trying whitespace fixes...`);
+                    
+                    // Strategy 3: Try with whitespace fixes
+                    try {
+                        await runCmd(`git apply --ignore-whitespace --whitespace=fix "${normalizedPath}"`, repoBPath);
+                        console.log(`✅ Patch applied successfully with whitespace fixes`);
+                        patchApplied = true;
+                    } catch (whitespaceError) {
+                        console.log(`⚠️ Whitespace fix failed, trying ignore-whitespace only...`);
+                        
+                        // Strategy 4: Just ignore whitespace
+                        try {
+                            await runCmd(`git apply --ignore-whitespace "${normalizedPath}"`, repoBPath);
+                            console.log(`✅ Patch applied successfully with ignore-whitespace`);
+                            patchApplied = true;
+                        } catch (ignoreError) {
+                            // Strategy 5: Last resort - basic apply
+                            console.log(`⚠️ All methods failed. Trying basic apply as last resort...`);
+                            await runCmd(`git apply "${normalizedPath}"`, repoBPath);
+                            console.log(`✅ Patch applied successfully with basic apply`);
+                            patchApplied = true;
+                        }
+                    }
+                }
+            }
+            
+            if (!patchApplied) {
+                throw new Error("All patch apply strategies failed");
+            }
+            
+            // Double-check for .rej files (partial applies)
+            try {
+                const rejectFiles = await runCmd(`find . -name "*.rej" 2>/dev/null || true`, repoBPath);
+                if (rejectFiles && rejectFiles.trim()) {
+                    console.log(`⚠️ Warning: Some parts of the patch were rejected:`);
+                    console.log(rejectFiles);
+                    appliedWithRejects = true;
+                }
+            } catch {}
+            
+            // Verify we have actual changes to commit
+            const verifyStatus = await git.status();
+            if (verifyStatus.files.length === 0) {
+                console.log(`⚠️ Warning: No files changed after patch application`);
+                // This is OK if we had rejects - we'll handle it later
+            }
         } catch (applyError) {
             // Clean up patch file
             try {
                 await unlink(patchFile);
             } catch {}
-            throw new Error(`Failed to apply patch: ${applyError.message}`);
+            
+            // Better error reporting - handle different error types
+            let errorMsg = 'Unknown error';
+            if (typeof applyError === 'string') {
+                errorMsg = applyError;
+            } else if (applyError instanceof Error) {
+                errorMsg = applyError.message || applyError.toString();
+            } else if (applyError) {
+                errorMsg = applyError.message || 
+                          applyError.stderr || 
+                          applyError.stdout || 
+                          String(applyError);
+            }
+            
+            console.error(`\n❌ Patch apply error details:`);
+            console.error(`Error message: ${errorMsg}`);
+            if (applyError && applyError.stderr) {
+                console.error(`STDERR: ${applyError.stderr}`);
+            }
+            if (applyError && applyError.stdout) {
+                console.error(`STDOUT: ${applyError.stdout}`);
+            }
+            if (applyError && applyError.stack) {
+                console.error(`Stack: ${applyError.stack}`);
+            }
+            
+            // Save patch file for debugging (with error suffix)
+            try {
+                const errorPatchFile = path.join(repoBPath, `temp-patch-${timestamp}.error.patch`);
+                await writeFile(errorPatchFile, patch, "utf8");
+                console.error(`\n💾 Failed patch saved to: ${errorPatchFile}`);
+            } catch (saveErr) {
+                console.warn("Could not save error patch file:", saveErr.message);
+            }
+            
+            throw new Error(`Failed to apply patch: ${errorMsg}`);
         }
         
         // Clean up patch file
@@ -195,7 +537,55 @@ export const createPRonGitHub = async (title, description, patch) => {
         
         // Check if there are any changes
         const status = await git.status();
-        if (status.files.length === 0) {
+        
+        // Clean up .rej files - they're just rejection info, not actual changes
+        // First, find and read .rej files for PR description
+        let rejectDetails = '';
+        if (appliedWithRejects) {
+            try {
+                const rejectFiles = await runCmd(`find . -name "*.rej" 2>/dev/null || true`, repoBPath);
+                if (rejectFiles && rejectFiles.trim()) {
+                    const rejectFileList = rejectFiles.trim().split('\n').filter(f => f.trim());
+                    rejectDetails = `\n\n⚠️ **Parts of the patch could not be automatically applied**\n\n`;
+                    rejectDetails += `The following files had conflicts and need manual review:\n`;
+                    
+                    for (const rejectFile of rejectFileList) {
+                        try {
+                            // Handle both relative and absolute paths from find command
+                            const rejectFilePath = rejectFile.startsWith('/') 
+                                ? rejectFile 
+                                : path.join(repoBPath, rejectFile.replace(/^\.\//, ''));
+                            const rejectContent = await readFile(rejectFilePath, 'utf8');
+                            // Limit content to first 500 chars to avoid huge PR descriptions
+                            const preview = rejectContent.substring(0, 500);
+                            // Show relative path in PR description
+                            const relativePath = rejectFile.replace(/^\.\//, '');
+                            rejectDetails += `\n**${relativePath}** (first 500 chars):\n\`\`\`\n${preview}${rejectContent.length > 500 ? '...' : ''}\n\`\`\`\n`;
+                        } catch (readErr) {
+                            rejectDetails += `\n**${rejectFile}** (could not read file: ${readErr.message})\n`;
+                        }
+                    }
+                    
+                    rejectDetails += `\nPlease review these rejected parts and apply them manually if needed.`;
+                }
+            } catch (err) {
+                console.warn("Could not read reject files:", err.message);
+            }
+        }
+        
+        // Remove .rej files before staging (they're not meant to be committed)
+        try {
+            await runCmd(`find . -name "*.rej" -delete 2>/dev/null || true`, repoBPath);
+            console.log(`🧹 Cleaned up .rej files before commit`);
+        } catch (cleanupErr) {
+            console.warn("Could not clean up .rej files:", cleanupErr.message);
+        }
+        
+        // Re-check status after cleanup
+        const finalStatus = await git.status();
+        const actualFiles = finalStatus.files.filter(file => !file.path.endsWith('.rej'));
+        
+        if (actualFiles.length === 0) {
             // No changes, delete branch and return
             await git.checkout(repoBBranch);
             await git.deleteLocalBranch(branchName);
@@ -203,7 +593,12 @@ export const createPRonGitHub = async (title, description, patch) => {
             return null;
         }
         
-        // Stage all changes
+        // Add reject details to description
+        if (appliedWithRejects) {
+            description += rejectDetails || `\n\n⚠️ **Note**: Some parts of the patch could not be automatically applied. Please review the changes carefully and check for any conflicts.`;
+        }
+        
+        // Stage all changes (excluding .rej files which are now deleted)
         await git.add(".");
         
         // Commit

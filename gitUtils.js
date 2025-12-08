@@ -45,36 +45,78 @@ export const saveLastProcessedCommit = async (commitHash) => {
 };
 
 // Get the latest commit hash from remote branch
+// Note: Assumes fetch has already been called
 export const getLatestCommitHash = async (git, branch) => {
-  await git.fetch();
-  const log = await git.log([`origin/${branch}`, "-1"]);
-  return log.latest?.hash || null;
+  try {
+    const log = await git.log([`origin/${branch}`, "-1"]);
+    return log.latest?.hash || null;
+  } catch (err) {
+    console.warn(`Could not get latest commit from origin/${branch}:`, err.message);
+    return null;
+  }
 };
 
-// Get diff between last processed commit and latest commit
+// Get diff between local HEAD and remote origin/branch
+// This compares the local clone of A with the remote A repository
 export const getLatestDiff = async (git, branch) => {
-  await git.fetch();
-  const lastProcessed = await getLastProcessedCommit();
-  const latestCommit = await getLatestCommitHash(git, branch);
-
-  if (!latestCommit) {
-    return { diff: "", latestCommit: null };
-  }
-
-  // If no previous commit tracked, get diff from HEAD
-  if (!lastProcessed) {
-    const diff = await git.diff([`HEAD`, `origin/${branch}`]);
-    return { diff, latestCommit };
-  }
-
-  // Get diff from last processed commit to latest
   try {
-    const diff = await git.diff([lastProcessed, latestCommit]);
-    return { diff, latestCommit };
+    // Fetch latest changes from remote
+    console.log(`Fetching latest changes from origin/${branch}...`);
+    await git.fetch("origin", branch);
+    
+    // Get the latest commit hash from remote
+    const latestCommit = await getLatestCommitHash(git, branch);
+    
+    if (!latestCommit) {
+      return { diff: "", latestCommit: null, localCommit: null };
+    }
+
+    // Get current local HEAD commit
+    let localCommit = null;
+    try {
+      const log = await git.log(["-1"]);
+      localCommit = log.latest?.hash || null;
+    } catch (err) {
+      console.warn("Could not get local HEAD commit:", err.message);
+    }
+
+    // Get diff between local HEAD and remote origin/branch
+    // This shows what's new in remote A compared to local A
+    const diff = await git.diff([
+      `HEAD`,
+      `origin/${branch}`,
+      "--diff-filter=ACDMRT", // Include Added, Copied, Deleted, Modified, Renamed, Type-changed files
+      "--unified=3" // More context lines
+    ]);
+
+    return { diff, latestCommit, localCommit };
   } catch (err) {
-    // If commit not found, fallback to HEAD comparison
-    console.warn("Last processed commit not found, using HEAD comparison");
-    const diff = await git.diff([`HEAD`, `origin/${branch}`]);
-    return { diff, latestCommit };
+    console.error("Error getting diff:", err.message);
+    return { diff: "", latestCommit: null, localCommit: null };
+  }
+};
+
+// Update local repository A to match remote A (after successful PR creation)
+export const updateLocalRepositoryA = async (git, branch) => {
+  try {
+    console.log(`\n🔄 Updating local Repository A to match remote...`);
+    
+    // Ensure we're on the correct branch
+    try {
+      await git.checkout(branch);
+    } catch (err) {
+      console.warn(`Branch ${branch} might not exist locally, fetching...`);
+      await git.fetch("origin", branch);
+      await git.checkout(branch);
+    }
+    
+    // Pull latest changes to sync local with remote
+    await git.pull("origin", branch);
+    
+    console.log(`✅ Local Repository A updated successfully`);
+    return true;
+  } catch (err) {
+    console.error("❌ Error updating local Repository A:", err.message);
+    return false;
   }
 };
