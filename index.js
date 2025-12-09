@@ -7,7 +7,7 @@ import {
   updateLocalRepositoryA,
   getRepoRoot,
 } from "./gitUtils.js";
-import { runCustomFunction } from "./runCustomFunction.js";
+import { mergeAndCreatePR } from "./prGenerator.js";
 
 // Handle both absolute and relative paths for REPO_A_PATH
 const repoAPathRaw = process.env.REPO_A_PATH;
@@ -73,7 +73,7 @@ const updateRepository = async () => {
       );
       console.log("→ Running Smart PR logic...");
 
-      const result = await runCustomFunction(diff, latestCommit, commitMessages);
+      const result = await mergeAndCreatePR(diff, latestCommit, commitMessages);
 
       if (result.success) {
         if (result.prUrl) {
