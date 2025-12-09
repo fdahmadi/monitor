@@ -56,6 +56,59 @@ export const getLatestCommitHash = async (git, branch) => {
   }
 };
 
+// Get commit messages between two commits
+export const getCommitMessages = async (git, fromCommit, toCommit) => {
+  try {
+    // If commits are the same, no new commits
+    if (fromCommit && toCommit && fromCommit === toCommit) {
+      return [];
+    }
+
+    // Build log range using git range format
+    // Format: fromCommit..toCommit (commits reachable from toCommit but not from fromCommit)
+    let logRange;
+    if (!fromCommit) {
+      // No local commit yet, get all commits up to toCommit (just get latest few)
+      // Limit to avoid too many commits
+      logRange = [toCommit, "-20"]; // Last 20 commits max
+    } else {
+      // Get commits between fromCommit (exclusive) and toCommit (inclusive)
+      // Using range format: fromCommit..toCommit
+      logRange = [`${fromCommit}..${toCommit}`];
+    }
+
+    const log = await git.log(logRange);
+
+    // simple-git returns commits in reverse chronological order (newest first)
+    // Reverse to get chronological order (oldest first)
+    const commits = log.all.map(commit => ({
+      hash: commit.hash,
+      message: commit.message,
+      date: commit.date
+    })).reverse();
+
+    return commits;
+  } catch (err) {
+    console.warn("Could not get commit messages:", err.message);
+    // Fallback: try to get at least the latest commit message
+    try {
+      if (toCommit) {
+        const log = await git.log([toCommit, "-1"]);
+        if (log.latest) {
+          return [{
+            hash: log.latest.hash,
+            message: log.latest.message,
+            date: log.latest.date
+          }];
+        }
+      }
+    } catch (fallbackErr) {
+      console.warn("Fallback commit message retrieval also failed:", fallbackErr.message);
+    }
+    return [];
+  }
+};
+
 // Get diff between local HEAD and remote origin/branch
 // This compares the local clone of A with the remote A repository
 export const getLatestDiff = async (git, branch) => {
@@ -68,7 +121,7 @@ export const getLatestDiff = async (git, branch) => {
     const latestCommit = await getLatestCommitHash(git, branch);
     
     if (!latestCommit) {
-      return { diff: "", latestCommit: null, localCommit: null };
+      return { diff: "", latestCommit: null, localCommit: null, commitMessages: [] };
     }
 
     // Get current local HEAD commit
@@ -80,6 +133,15 @@ export const getLatestDiff = async (git, branch) => {
       console.warn("Could not get local HEAD commit:", err.message);
     }
 
+    // Get commit messages between local HEAD and remote
+    let commitMessages = [];
+    if (localCommit || latestCommit) {
+      commitMessages = await getCommitMessages(git, localCommit || "HEAD", latestCommit);
+      if (commitMessages.length > 0) {
+        console.log(`Found ${commitMessages.length} commit(s) between local and remote`);
+      }
+    }
+
     // Get diff between local HEAD and remote origin/branch
     // This shows what's new in remote A compared to local A
     const diff = await git.diff([
@@ -89,10 +151,10 @@ export const getLatestDiff = async (git, branch) => {
       "--unified=3" // More context lines
     ]);
 
-    return { diff, latestCommit, localCommit };
+    return { diff, latestCommit, localCommit, commitMessages };
   } catch (err) {
     console.error("Error getting diff:", err.message);
-    return { diff: "", latestCommit: null, localCommit: null };
+    return { diff: "", latestCommit: null, localCommit: null, commitMessages: [] };
   }
 };
 

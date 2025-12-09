@@ -1,5 +1,6 @@
 import "dotenv/config";
 import path from "node:path";
+import cron from "node-cron";
 import {
   createGit,
   getLatestDiff,
@@ -47,7 +48,7 @@ const updateRepository = async () => {
       console.log(`Repo Root: ${repoRoot}`);
     }
 
-    const { diff, latestCommit, localCommit } = await getLatestDiff(git, repoABranch);
+    const { diff, latestCommit, localCommit, commitMessages } = await getLatestDiff(git, repoABranch);
 
     if (!latestCommit) {
       console.log("⚠️ Could not determine latest commit from remote");
@@ -59,13 +60,20 @@ const updateRepository = async () => {
     }
     console.log(`Remote A commit: ${latestCommit.substring(0, 7)}`);
 
+    if (commitMessages.length > 0) {
+      console.log(`📝 Commit messages from Repository A:`);
+      commitMessages.forEach((commit, idx) => {
+        console.log(`  ${idx + 1}. [${commit.hash.substring(0, 7)}] ${commit.message.split('\n')[0]}`);
+      });
+    }
+
     if (diff && diff.trim().length > 0) {
       console.log(
         `✅ Differences found between local and remote A`
       );
       console.log("→ Running Smart PR logic...");
 
-      const result = await runCustomFunction(diff, latestCommit);
+      const result = await runCustomFunction(diff, latestCommit, commitMessages);
 
       if (result.success) {
         if (result.prUrl) {
@@ -103,8 +111,34 @@ const updateRepository = async () => {
   }
 };
 
-// Run immediately on startup, then every 5 minutes
+// Run immediately on startup, then every 5 minutes using cron
 console.log("🚀 Monitor started");
-console.log("⏰ Will check for updates every 5 minutes");
+console.log("⏰ Will check for updates every 5 minutes (using cron: */5 * * * *)");
+
+// Run immediately on startup
 updateRepository();
-setInterval(updateRepository, 5 * 60 * 1000);
+
+// Schedule to run every 5 minutes using cron
+// Cron expression: */5 * * * * means "every 5 minutes"
+const cronSchedule = process.env.CRON_SCHEDULE || "*/5 * * * *";
+
+const task = cron.schedule(cronSchedule, () => {
+  console.log(`\n⏰ Scheduled check triggered at ${new Date().toISOString()}`);
+  updateRepository();
+}, {
+  scheduled: true,
+  timezone: "UTC"
+});
+
+// Handle graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n🛑 Shutting down gracefully...');
+  task.stop();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n🛑 Shutting down gracefully...');
+  task.stop();
+  process.exit(0);
+});

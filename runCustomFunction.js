@@ -8,7 +8,7 @@ import {
     createPRonGitHub,
 } from "./createSmartPR.js";
 
-export const runCustomFunction = async (diffText, latestCommit) => {
+export const runCustomFunction = async (diffText, latestCommit, commitMessages = []) => {
     console.log("Running Smart PR Generator...");
 
     try {
@@ -33,7 +33,7 @@ export const runCustomFunction = async (diffText, latestCommit) => {
         const filesFromB = await readFilesFromB(changedFilesMap);
 
         console.log("Sending to Claude for intelligent merge...");
-        const claudeResponse = await generatePRviaClaude(diffText, filesFromA, filesFromB);
+        const claudeResponse = await generatePRviaClaude(diffText, filesFromA, filesFromB, commitMessages);
 
         console.log("Parsing Claude response...");
         let { title, description, patch } = parseClaudeResponse(claudeResponse);
@@ -82,6 +82,79 @@ export const runCustomFunction = async (diffText, latestCommit) => {
         }
 
         console.log(`✅ Patch extracted and validated (${patch.length} chars, ${patchLines.length} lines)`);
+        
+        // Helper function to create commit URL
+        const createCommitUrl = (commitHash) => {
+            const repoAUrl = process.env.REPO_A_URL;
+            if (!repoAUrl) return null;
+            
+            // Remove .git suffix if present
+            const baseUrl = repoAUrl.replace(/\.git$/, '');
+            
+            // Handle different Git hosting platforms
+            if (baseUrl.includes('github.com')) {
+                // GitHub format: https://github.com/owner/repo/commit/{hash}
+                return `${baseUrl}/commit/${commitHash}`;
+            } else if (baseUrl.includes('gitlab.com') || baseUrl.includes('gitlab')) {
+                // GitLab format: https://gitlab.com/owner/repo/-/commit/{hash}
+                return `${baseUrl}/-/commit/${commitHash}`;
+            } else if (baseUrl.includes('bitbucket.org')) {
+                // Bitbucket format: https://bitbucket.org/owner/repo/commits/{hash}
+                return `${baseUrl}/commits/${commitHash}`;
+            } else {
+                // Generic fallback - try GitHub format
+                return `${baseUrl}/commit/${commitHash}`;
+            }
+        };
+        
+        // Enhance description with commit messages from Repository A
+        if (commitMessages && commitMessages.length > 0) {
+            description += `\n\n---\n\n## 📝 Commit Messages from Repository A\n\n`;
+            if (commitMessages.length === 1) {
+                const commit = commitMessages[0];
+                const commitHashShort = commit.hash.substring(0, 7);
+                const commitUrl = createCommitUrl(commit.hash);
+                
+                // Extract first line (title) and body
+                const messageLines = commit.message.trim().split('\n');
+                const messageTitle = messageLines[0];
+                const messageBody = messageLines.slice(1).filter(line => line.trim()).join('\n');
+                
+                // Format: "Title (link to commit)"
+                if (commitUrl) {
+                    description += `- ${messageTitle} ([${commitHashShort}](${commitUrl}))\n\n`;
+                } else {
+                    description += `- ${messageTitle} (\`${commitHashShort}\`)\n\n`;
+                }
+                
+                if (messageBody) {
+                    description += `\`\`\`\n${messageBody}\n\`\`\`\n`;
+                }
+            } else {
+                description += `This PR includes changes from **${commitMessages.length} commits**:\n\n`;
+                commitMessages.forEach((commit, idx) => {
+                    const commitHashShort = commit.hash.substring(0, 7);
+                    const commitUrl = createCommitUrl(commit.hash);
+                    
+                    // Extract first line (title) and body
+                    const messageLines = commit.message.trim().split('\n');
+                    const messageTitle = messageLines[0];
+                    const messageBody = messageLines.slice(1).filter(line => line.trim()).join('\n');
+                    
+                    // Format: "1. Title (link to commit)"
+                    if (commitUrl) {
+                        description += `${idx + 1}. ${messageTitle} ([${commitHashShort}](${commitUrl}))\n\n`;
+                    } else {
+                        description += `${idx + 1}. ${messageTitle} (\`${commitHashShort}\`)\n\n`;
+                    }
+                    
+                    if (messageBody) {
+                        description += `   \`\`\`\n   ${messageBody.replace(/\n/g, '\n   ')}\n   \`\`\`\n\n`;
+                    }
+                });
+            }
+        }
+        
         console.log("Creating PR on GitHub...");
         const prUrl = await createPRonGitHub(title, description, patch);
 

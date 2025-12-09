@@ -130,7 +130,7 @@ export const readFilesFromA = async (filesMap) => {
     return result;
 };
 
-export const generatePRviaClaude = async (diffText, filesFromA, filesFromB) => {
+export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, commitMessages = []) => {
     const repoAUrl = process.env.REPO_A_URL;
     const repoBUrl = process.env.REPO_B_URL;
     const model = process.env.CLAUDE_MODEL || "claude-3-5-sonnet-20241022";
