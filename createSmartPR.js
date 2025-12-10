@@ -10,9 +10,10 @@ const client = new Anthropic({
 });
 
 // Configuration for rate limit handling
-const MAX_TOKENS_PER_REQUEST = parseInt(process.env.MAX_TOKENS_PER_REQUEST || "400000", 10); // Safe limit below 450k
-const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || "50000", 10); // Max chars per file (default 50KB)
-const MAX_FILES_TO_PROCESS = parseInt(process.env.MAX_FILES_TO_PROCESS || "20", 10); // Max files per request
+const MAX_TOKENS_PER_REQUEST = parseInt(process.env.MAX_TOKENS_PER_REQUEST || "180000", 10); // Safe limit below 200k (API hard limit)
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || "30000", 10); // Max chars per file (default 30KB)
+const MAX_FILES_TO_PROCESS = parseInt(process.env.MAX_FILES_TO_PROCESS || "10", 10); // Max files per request
+const MAX_DIFF_SIZE = parseInt(process.env.MAX_DIFF_SIZE || "500000", 10); // Max diff size (500KB)
 const RETRY_MAX_ATTEMPTS = parseInt(process.env.RETRY_MAX_ATTEMPTS || "3", 10);
 const RETRY_BASE_DELAY_MS = parseInt(process.env.RETRY_BASE_DELAY_MS || "60000", 10); // 1 minute base delay
 
@@ -23,17 +24,24 @@ const estimateTokens = (text) => {
     return Math.ceil(text.length / 3.5);
 };
 
+// Check if file should be excluded (auto-generated or build files)
+const shouldExcludeFile = (filePath) => {
+    // Exclude auto-generated files
+    if (filePath.includes('/generated/') || 
+        filePath.endsWith('.generated.ts') ||
+        filePath.includes('node_modules/') || 
+        filePath.includes('dist/') || 
+        filePath.includes('build/') ||
+        filePath.includes('.git/')) {
+        return true;
+    }
+    return false;
+};
+
 // Check if file should be truncated (e.g., large files)
 const shouldTruncateFile = (filePath, content) => {
     // Always truncate very large files (over MAX_FILE_SIZE)
     if (content && content.length > MAX_FILE_SIZE) {
-        return true;
-    }
-    // Filter out node_modules, build artifacts, etc.
-    if (filePath.includes('node_modules/') || 
-        filePath.includes('dist/') || 
-        filePath.includes('build/') ||
-        filePath.includes('.git/')) {
         return true;
     }
     return false;
@@ -221,8 +229,16 @@ export const filterTranslationFilesBeforeReading = (filesMap) => {
     const filteredTranslationFiles = new Map();
     const skippedTranslationFiles = [];
     
-    // Separate translation files from others
+    // Separate translation files from others, and exclude auto-generated files
+    const excludedFiles = [];
     for (const [filePath, fileInfo] of filesMap.entries()) {
+        // Exclude auto-generated and build files
+        if (shouldExcludeFile(filePath)) {
+            excludedFiles.push(filePath);
+            console.log(`   🚫 Excluding auto-generated/build file: ${filePath}`);
+            continue;
+        }
+        
         const info = getTranslationFileInfo(filePath);
         if (info) {
             // Group by category (back/front)
@@ -233,6 +249,10 @@ export const filterTranslationFilesBeforeReading = (filesMap) => {
         } else {
             nonTranslationFiles.set(filePath, fileInfo);
         }
+    }
+    
+    if (excludedFiles.length > 0) {
+        console.log(`🚫 Excluded ${excludedFiles.length} auto-generated/build file(s)`);
     }
     
     // For each category, keep only one sample (prefer 'en.json' if available, otherwise first one)
@@ -383,8 +403,15 @@ export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, comm
     const repoBUrl = process.env.REPO_B_URL;
     const model = process.env.CLAUDE_MODEL || "claude-3-5-sonnet-20241022";
 
+    // Truncate diff if too large
+    let truncatedDiff = diffText;
+    if (diffText.length > MAX_DIFF_SIZE) {
+        console.log(`⚠️ Diff too large (${diffText.length} chars), truncating to ${MAX_DIFF_SIZE} chars...`);
+        truncatedDiff = diffText.substring(0, MAX_DIFF_SIZE) + '\n... [diff truncated - too large]';
+    }
+
     // Filter files to reduce token usage (if not already filtered)
-    const { selected: selectedFiles, skippedTranslationFiles: skippedFromFilter } = filterAndPrioritizeFiles(filesFromA, filesFromB, diffText);
+    const { selected: selectedFiles, skippedTranslationFiles: skippedFromFilter } = filterAndPrioritizeFiles(filesFromA, filesFromB, truncatedDiff);
     
     // Use skippedTranslationFiles from caller if provided, otherwise use from filter
     const skippedTranslationFiles = skippedTranslationFilesFromCaller.length > 0 
@@ -393,7 +420,7 @@ export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, comm
     
     // Build file information section (only for selected files)
     const fileInfoSections = [];
-    let totalEstimatedTokens = estimateTokens(diffText);
+    let totalEstimatedTokens = estimateTokens(truncatedDiff);
     
     for (const filePath of selectedFiles) {
         const fileA = filesFromA[filePath];
@@ -439,10 +466,15 @@ ${fileB.content || "(file not found in B)"}
         fileInfoSections.push(section);
     }
     
-    // Check if we're approaching token limit
+    // Check if we're approaching token limit (hard limit is 200k)
     if (totalEstimatedTokens > MAX_TOKENS_PER_REQUEST) {
         console.warn(`⚠️ Estimated tokens (${totalEstimatedTokens}) exceeds safe limit (${MAX_TOKENS_PER_REQUEST})`);
-        console.warn(`   Consider reducing MAX_FILES_TO_PROCESS or MAX_FILE_SIZE in environment variables`);
+        console.warn(`   API hard limit is 200,000 tokens. Consider reducing MAX_FILES_TO_PROCESS or MAX_FILE_SIZE.`);
+        
+        // If still too high, throw error to prevent API rejection
+        if (totalEstimatedTokens > 190000) {
+            throw new Error(`Estimated tokens (${totalEstimatedTokens}) too close to API hard limit (200k). Please reduce MAX_FILES_TO_PROCESS or MAX_FILE_SIZE.`);
+        }
     }
 
     // Add note about filtered files if any were skipped
@@ -490,7 +522,7 @@ Repository B URL: ${repoBUrl}
 
 Latest changes in Repository A (Git Diff):
 -------------------------
-${diffText}
+${truncatedDiff}
 
 Detailed file information:
 -------------------------
