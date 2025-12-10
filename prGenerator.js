@@ -117,6 +117,60 @@ export const mergeAndCreatePR = async (diffText, latestCommit, commitMessages = 
             }
         };
         
+        // Add note about translation files if any were filtered
+        const translationFiles = Array.from(changedFilesMap.keys()).filter(filePath => 
+            filePath.includes('/lang/') && filePath.endsWith('.json')
+        );
+        
+        if (translationFiles.length > 0) {
+            // Group by category (front/back)
+            const byCategory = {};
+            for (const filePath of translationFiles) {
+                const match = filePath.match(/\/lang\/(back|front)\/([^\/]+)\.json$/);
+                if (match) {
+                    const category = match[1];
+                    const language = match[2];
+                    if (!byCategory[category]) {
+                        byCategory[category] = [];
+                    }
+                    byCategory[category].push({ filePath, language });
+                }
+            }
+            
+            // Check if we have multiple languages per category (meaning some were filtered)
+            let hasFiltered = false;
+            for (const [category, files] of Object.entries(byCategory)) {
+                if (files.length > 1) {
+                    hasFiltered = true;
+                    break;
+                }
+            }
+            
+            if (hasFiltered) {
+                description += `\n\n---\n\n## 🌐 Translation Files Note\n\n`;
+                description += `This PR includes changes to translation files. `;
+                description += `Only one sample file per category (frontend/backend) was processed by the AI to reduce token usage.\n\n`;
+                description += `**Please apply the same changes to all other language files:**\n\n`;
+                
+                for (const [category, files] of Object.entries(byCategory)) {
+                    if (files.length > 1) {
+                        // Sort to find the sample (prefer 'en')
+                        files.sort((a, b) => {
+                            if (a.language === 'en') return -1;
+                            if (b.language === 'en') return 1;
+                            return a.language.localeCompare(b.language);
+                        });
+                        
+                        const sample = files[0];
+                        const others = files.slice(1).map(f => f.language).join(', ');
+                        description += `- **${category}/**: Sample file \`${sample.language}.json\` included. Apply same changes to: \`${others}\`\n`;
+                    }
+                }
+                
+                description += `\nYou can review the git diff to see all translation file changes and apply them manually to other languages.\n`;
+            }
+        }
+        
         // Enhance description with commit messages from Repository A
         if (commitMessages && commitMessages.length > 0) {
             description += `\n\n---\n\n## 📝 Commit Messages from Repository A\n\n`;

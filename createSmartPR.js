@@ -206,23 +206,106 @@ export const readFilesFromA = async (filesMap) => {
     return result;
 };
 
+// Check if file is a translation file
+const isTranslationFile = (filePath) => {
+    return filePath.includes('/lang/') && filePath.endsWith('.json');
+};
+
+// Get translation file category (front/back) and language code
+const getTranslationFileInfo = (filePath) => {
+    if (!isTranslationFile(filePath)) return null;
+    
+    // Match patterns like: .../lang/back/en.json or .../lang/front/de.json
+    const match = filePath.match(/\/lang\/(back|front)\/([^\/]+)\.json$/);
+    if (match) {
+        return {
+            category: match[1], // 'back' or 'front'
+            language: match[2], // 'en', 'de', 'fr', etc.
+            filePath
+        };
+    }
+    return null;
+};
+
+// Filter translation files - keep only one sample per category (front/back)
+const filterTranslationFiles = (filePaths) => {
+    const translationFiles = new Map(); // category -> { filePath, language }
+    const nonTranslationFiles = [];
+    const filteredTranslationFiles = [];
+    
+    // Separate translation files from others
+    for (const filePath of filePaths) {
+        const info = getTranslationFileInfo(filePath);
+        if (info) {
+            // Group by category (back/front)
+            if (!translationFiles.has(info.category)) {
+                translationFiles.set(info.category, []);
+            }
+            translationFiles.get(info.category).push(info);
+        } else {
+            nonTranslationFiles.push(filePath);
+        }
+    }
+    
+    // For each category, keep only one sample (prefer 'en.json' if available, otherwise first one)
+    for (const [category, files] of translationFiles.entries()) {
+        // Sort: prefer 'en.json', then alphabetically
+        files.sort((a, b) => {
+            if (a.language === 'en') return -1;
+            if (b.language === 'en') return 1;
+            return a.language.localeCompare(b.language);
+        });
+        
+        // Keep only the first one (preferred sample)
+        const sample = files[0];
+        filteredTranslationFiles.push(sample.filePath);
+        
+        // Log skipped files
+        if (files.length > 1) {
+            const skipped = files.slice(1).map(f => f.language).join(', ');
+            console.log(`   📝 Translation files (${category}): Keeping ${sample.language}.json, skipping ${files.length - 1} other(s): ${skipped}`);
+        }
+    }
+    
+    // Collect all skipped translation files (all except the selected sample from each category)
+    const skippedTranslationFiles = [];
+    for (const [category, files] of translationFiles.entries()) {
+        if (files.length > 1) {
+            // Skip the first one (selected sample), add the rest
+            skippedTranslationFiles.push(...files.slice(1).map(info => info.filePath));
+        }
+    }
+    
+    return {
+        selected: [...nonTranslationFiles, ...filteredTranslationFiles],
+        skippedTranslationFiles
+    };
+};
+
 // Filter and prioritize files to reduce token usage
 const filterAndPrioritizeFiles = (filesFromA, filesFromB, diffText) => {
     const filePaths = Object.keys(filesFromA);
     
-    // If we have too many files, prioritize important ones
-    if (filePaths.length > MAX_FILES_TO_PROCESS) {
-        console.log(`⚠️ Too many files (${filePaths.length}), filtering to most important ${MAX_FILES_TO_PROCESS}...`);
+    // First, filter translation files - keep only one sample per category
+    const { selected: filesAfterTranslationFilter, skippedTranslationFiles } = filterTranslationFiles(filePaths);
+    
+    if (skippedTranslationFiles.length > 0) {
+        console.log(`🌐 Filtered ${skippedTranslationFiles.length} translation file(s) - keeping only 1 sample per category (front/back)`);
+    }
+    
+    // If we still have too many files, prioritize important ones
+    if (filesAfterTranslationFilter.length > MAX_FILES_TO_PROCESS) {
+        console.log(`⚠️ Too many files (${filesAfterTranslationFilter.length}), filtering to most important ${MAX_FILES_TO_PROCESS}...`);
         
         // Priority order:
         // 1. Source code files (not translation files)
         // 2. Configuration files
         // 3. Translation files (lowest priority)
         
-        const prioritized = filePaths
+        const prioritized = filesAfterTranslationFilter
             .map(filePath => {
                 const priority = 
-                    filePath.includes('/lang/') ? 3 : // Translation files - lowest
+                    isTranslationFile(filePath) ? 3 : // Translation files - lowest
                     (filePath.endsWith('.ts') || filePath.endsWith('.tsx') || 
                      filePath.endsWith('.js') || filePath.endsWith('.jsx') ||
                      filePath.endsWith('.py') || filePath.endsWith('.graphql')) ? 1 : // Source code - highest
@@ -234,11 +317,11 @@ const filterAndPrioritizeFiles = (filesFromA, filesFromB, diffText) => {
             .slice(0, MAX_FILES_TO_PROCESS)
             .map(item => item.filePath);
         
-        console.log(`📋 Selected ${prioritized.length} files for processing (skipped ${filePaths.length - prioritized.length} files)`);
-        return prioritized;
+        console.log(`📋 Selected ${prioritized.length} files for processing (skipped ${filesAfterTranslationFilter.length - prioritized.length} files)`);
+        return { selected: prioritized, skippedTranslationFiles };
     }
     
-    return filePaths;
+    return { selected: filesAfterTranslationFilter, skippedTranslationFiles };
 };
 
 export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, commitMessages = [], retryAttempt = 0) => {
@@ -247,7 +330,7 @@ export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, comm
     const model = process.env.CLAUDE_MODEL || "claude-3-5-sonnet-20241022";
 
     // Filter files to reduce token usage
-    const selectedFiles = filterAndPrioritizeFiles(filesFromA, filesFromB, diffText);
+    const { selected: selectedFiles, skippedTranslationFiles } = filterAndPrioritizeFiles(filesFromA, filesFromB, diffText);
     
     // Build file information section (only for selected files)
     const fileInfoSections = [];
@@ -306,9 +389,38 @@ ${fileB.content || "(file not found in B)"}
     // Add note about filtered files if any were skipped
     let fileNote = '';
     const allFiles = Object.keys(filesFromA);
-    if (allFiles.length > selectedFiles.length) {
-        const skippedFiles = allFiles.filter(f => !selectedFiles.includes(f));
-        fileNote = `\n\nNOTE: ${skippedFiles.length} file(s) were skipped due to size limits. Please review the git diff for complete changes.\nSkipped files: ${skippedFiles.slice(0, 10).join(', ')}${skippedFiles.length > 10 ? '...' : ''}\n`;
+    const skippedNonTranslationFiles = allFiles.filter(f => 
+        !selectedFiles.includes(f) && !skippedTranslationFiles.includes(f)
+    );
+    
+    // Add note about translation files
+    if (skippedTranslationFiles.length > 0) {
+        // Group skipped translation files by category
+        const skippedByCategory = {};
+        for (const filePath of skippedTranslationFiles) {
+            const info = getTranslationFileInfo(filePath);
+            if (info) {
+                if (!skippedByCategory[info.category]) {
+                    skippedByCategory[info.category] = [];
+                }
+                skippedByCategory[info.category].push(info.language);
+            }
+        }
+        
+        fileNote += `\n\n🌐 TRANSLATION FILES NOTE:\n`;
+        fileNote += `Only one sample translation file per category (front/back) was included in this request.\n`;
+        fileNote += `The same changes should be applied to ALL other language files in the same category.\n\n`;
+        
+        for (const [category, languages] of Object.entries(skippedByCategory)) {
+            fileNote += `- ${category}/: Sample file included. Apply same changes to: ${languages.join(', ')}\n`;
+        }
+        fileNote += `\nPlease review the git diff and apply the same translation changes to all language files.\n`;
+    }
+    
+    // Add note about other skipped files
+    if (skippedNonTranslationFiles.length > 0) {
+        fileNote += `\n\nNOTE: ${skippedNonTranslationFiles.length} other file(s) were skipped due to size limits. Please review the git diff for complete changes.\n`;
+        fileNote += `Skipped files: ${skippedNonTranslationFiles.slice(0, 10).join(', ')}${skippedNonTranslationFiles.length > 10 ? '...' : ''}\n`;
     }
 
     const prompt = `
