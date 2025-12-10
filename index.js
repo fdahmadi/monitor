@@ -88,8 +88,7 @@ const updateRepository = async () => {
       // Process each commit separately (starting from oldest)
       for (let i = 0; i < sortedCommits.length; i++) {
         const commit = sortedCommits[i];
-        const commit = commitMessages[i];
-        console.log(`\n📦 Processing commit ${i + 1}/${commitMessages.length}: ${commit.hash.substring(0, 7)}`);
+        console.log(`\n📦 Processing commit ${i + 1}/${sortedCommits.length}: ${commit.hash.substring(0, 7)}`);
         console.log(`   Message: ${commit.message.split('\n')[0]}`);
 
         try {
