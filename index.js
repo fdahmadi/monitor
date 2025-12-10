@@ -18,6 +18,10 @@ const repoAPath = path.isAbsolute(repoAPathRaw)
   : path.resolve(process.cwd(), repoAPathRaw);
 const repoABranch = process.env.REPO_A_BRANCH || "main";
 
+// Get commit wait time from environment (in minutes, default: 3 minutes)
+const commitWaitTimeMinutes = parseInt(process.env.COMMIT_WAIT_TIME || "3", 10);
+const commitWaitTimeMs = commitWaitTimeMinutes * 60 * 1000;
+
 // Validate required environment variables
 const requiredEnvVars = [
   "REPO_A_PATH",
@@ -101,6 +105,12 @@ const updateRepository = async () => {
             lastProcessedCommit = commit.hash;
             // Reset local repo A to this commit after skipping to prevent reprocessing
             await resetLocalToCommit(git, repoABranch, commit.hash);
+            
+            // Wait before processing next commit (if there is one)
+            if (i < sortedCommits.length - 1) {
+              console.log(`   ⏳ Waiting ${commitWaitTimeMinutes} minute(s) before processing next commit...`);
+              await new Promise(resolve => setTimeout(resolve, commitWaitTimeMs));
+            }
             continue;
           }
 
@@ -119,6 +129,12 @@ const updateRepository = async () => {
             // Reset local repo A to this commit after successful processing to prevent reprocessing
             console.log(`   🔄 Resetting local Repository A to commit ${commit.hash.substring(0, 7)}...`);
             await resetLocalToCommit(git, repoABranch, commit.hash);
+            
+            // Wait before processing next commit (if there is one)
+            if (i < sortedCommits.length - 1) {
+              console.log(`   ⏳ Waiting ${commitWaitTimeMinutes} minute(s) before processing next commit...`);
+              await new Promise(resolve => setTimeout(resolve, commitWaitTimeMs));
+            }
           } else {
             console.error(`   ❌ Failed to create PR: ${result.reason || result.error}`);
             console.error(`\n🛑 Stopping processing due to error. Remaining commits will not be processed.`);
@@ -187,16 +203,16 @@ const updateRepository = async () => {
   }
 };
 
-// Run immediately on startup, then every 5 minutes using cron
+// Run immediately on startup, then every hour using cron
 console.log("🚀 Monitor started");
-console.log("⏰ Will check for updates every 5 minutes (using cron: */5 * * * *)");
+console.log("⏰ Will check for updates every hour (using cron: 0 * * * *)");
 
 // Run immediately on startup
 updateRepository();
 
-// Schedule to run every 5 minutes using cron
-// Cron expression: */5 * * * * means "every 5 minutes"
-const cronSchedule = process.env.CRON_SCHEDULE || "*/5 * * * *";
+// Schedule to run every hour using cron
+// Cron expression: 0 * * * * means "at minute 0 of every hour"
+const cronSchedule = process.env.CRON_SCHEDULE || "0 * * * *";
 
 const task = cron.schedule(cronSchedule, () => {
   console.log(`\n⏰ Scheduled check triggered at ${new Date().toISOString()}`);
