@@ -5,6 +5,7 @@ import {
   createGit,
   getLatestDiff,
   updateLocalRepositoryA,
+  resetLocalToCommit,
   getRepoRoot,
   getSingleCommitDiff,
 } from "./gitUtils.js";
@@ -98,6 +99,8 @@ const updateRepository = async () => {
           if (!commitDiff || commitDiff.trim().length === 0) {
             console.log(`   ⚠️ No changes found in this commit, skipping...`);
             lastProcessedCommit = commit.hash;
+            // Reset local repo A to this commit after skipping to prevent reprocessing
+            await resetLocalToCommit(git, repoABranch, commit.hash);
             continue;
           }
 
@@ -108,11 +111,14 @@ const updateRepository = async () => {
             if (result.prUrl) {
               console.log(`   ✅ PR created successfully: ${result.prUrl}`);
               anyPRCreated = true;
-              lastProcessedCommit = commit.hash;
             } else {
               console.log(`   ℹ️ No PR created (no changes after merge)`);
-              lastProcessedCommit = commit.hash;
             }
+            lastProcessedCommit = commit.hash;
+            
+            // Reset local repo A to this commit after successful processing to prevent reprocessing
+            console.log(`   🔄 Resetting local Repository A to commit ${commit.hash.substring(0, 7)}...`);
+            await resetLocalToCommit(git, repoABranch, commit.hash);
           } else {
             console.error(`   ❌ Failed to create PR: ${result.reason || result.error}`);
             console.error(`\n🛑 Stopping processing due to error. Remaining commits will not be processed.`);
@@ -127,13 +133,13 @@ const updateRepository = async () => {
         }
       }
 
-      // After processing all commits, update local Repository A
+      // Final update check (shouldn't be needed since we update after each commit, but keeping as safety net)
       if (allSuccessful && lastProcessedCommit && lastProcessedCommit !== localCommit) {
-        console.log(`\n🔄 Updating local Repository A to latest processed commit...`);
+        console.log(`\n🔄 Final sync: Updating local Repository A to latest processed commit...`);
         await updateLocalRepositoryA(git, repoABranch);
-      } else if (anyPRCreated) {
-        // Even if some failed, update if at least one PR was created
-        console.log(`\n🔄 Updating local Repository A...`);
+      } else if (anyPRCreated && lastProcessedCommit && lastProcessedCommit !== localCommit) {
+        // Even if some failed, update if at least one PR was created (safety net)
+        console.log(`\n🔄 Final sync: Updating local Repository A...`);
         await updateLocalRepositoryA(git, repoABranch);
       }
     } else if (diff && diff.trim().length > 0) {

@@ -189,6 +189,28 @@ export const getSingleCommitDiff = async (git, commitHash) => {
   }
 };
 
+// Reset local repository A to a specific commit (after processing that commit)
+export const resetLocalToCommit = async (git, branch, commitHash) => {
+  try {
+    // Ensure we're on the correct branch
+    try {
+      await git.checkout(branch);
+    } catch (err) {
+      console.warn(`Branch ${branch} might not exist locally, fetching...`);
+      await git.fetch("origin", branch);
+      await git.checkout(branch);
+    }
+    
+    // Reset HEAD to the specific commit (hard reset to discard any uncommitted changes)
+    await git.reset(["--hard", commitHash]);
+    
+    return true;
+  } catch (err) {
+    console.error(`❌ Error resetting local Repository A to commit ${commitHash.substring(0, 7)}:`, err.message);
+    return false;
+  }
+};
+
 // Update local repository A to match remote A (after successful PR creation)
 export const updateLocalRepositoryA = async (git, branch) => {
   try {
