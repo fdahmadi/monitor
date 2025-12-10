@@ -42,6 +42,7 @@ export const mergeAndCreatePR = async (diffText, latestCommit, commitMessages = 
         const filesFromB = await readFilesFromB(changedFilesMap);
 
         console.log("Sending to Claude for intelligent merge...");
+        console.log(`📊 Estimated token usage: ~${Math.ceil((diffText.length + JSON.stringify(filesFromA).length + JSON.stringify(filesFromB).length) / 3.5)} tokens`);
         const claudeResponse = await generatePRviaClaude(diffText, filesFromA, filesFromB, commitMessages);
 
         console.log("Parsing Claude response...");

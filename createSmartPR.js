@@ -9,6 +9,50 @@ const client = new Anthropic({
     apiKey: process.env.CLAUDE_API_KEY,
 });
 
+// Configuration for rate limit handling
+const MAX_TOKENS_PER_REQUEST = parseInt(process.env.MAX_TOKENS_PER_REQUEST || "400000", 10); // Safe limit below 450k
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || "50000", 10); // Max chars per file (default 50KB)
+const MAX_FILES_TO_PROCESS = parseInt(process.env.MAX_FILES_TO_PROCESS || "20", 10); // Max files per request
+const RETRY_MAX_ATTEMPTS = parseInt(process.env.RETRY_MAX_ATTEMPTS || "3", 10);
+const RETRY_BASE_DELAY_MS = parseInt(process.env.RETRY_BASE_DELAY_MS || "60000", 10); // 1 minute base delay
+
+// Simple token estimator: ~4 characters per token (rough estimate for Claude)
+const estimateTokens = (text) => {
+    if (!text) return 0;
+    // Rough estimate: 4 chars = 1 token, but add some buffer
+    return Math.ceil(text.length / 3.5);
+};
+
+// Check if file should be filtered (e.g., large translation files)
+const shouldFilterFile = (filePath, content) => {
+    // Filter out very large translation JSON files (they're often repetitive)
+    if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
+        // For translation files, we'll truncate them significantly
+        return true;
+    }
+    // Filter out node_modules, build artifacts, etc.
+    if (filePath.includes('node_modules/') || 
+        filePath.includes('dist/') || 
+        filePath.includes('build/') ||
+        filePath.includes('.git/')) {
+        return true;
+    }
+    return false;
+};
+
+// Truncate content if too large
+const truncateContent = (content, maxSize = MAX_FILE_SIZE) => {
+    if (!content || content.length <= maxSize) return content;
+    
+    // Try to truncate at a reasonable point (e.g., at a newline)
+    const truncated = content.substring(0, maxSize);
+    const lastNewline = truncated.lastIndexOf('\n');
+    if (lastNewline > maxSize * 0.8) {
+        return truncated.substring(0, lastNewline) + '\n... [truncated - file too large]';
+    }
+    return truncated + '\n... [truncated - file too large]';
+};
+
 const runCmd = (cmd, cwd) => {
     return new Promise((resolve, reject) => {
         exec(cmd, { cwd }, (err, stdout, stderr) => {
@@ -90,7 +134,19 @@ export const readFilesFromB = async (filesMap) => {
     for (const [filePath, fileInfo] of filesMap.entries()) {
         const fullPath = path.join(repoB, filePath);
         try {
-            const content = await readFile(fullPath, "utf8");
+            let content = await readFile(fullPath, "utf8");
+            
+            // Filter or truncate large files
+            if (shouldFilterFile(filePath, content)) {
+                // For translation files, only keep a sample
+                if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
+                    // Keep only first 5000 chars for translation files
+                    content = truncateContent(content, 5000);
+                } else {
+                    content = truncateContent(content);
+                }
+            }
+            
             result[filePath] = { content, operation: fileInfo.operation };
         } catch {
             // File doesn't exist in B (normal for new files)
@@ -110,7 +166,17 @@ export const readFilesFromA = async (filesMap) => {
         if (fileInfo.operation === 'new') {
             const fullPath = path.join(repoA, filePath);
             try {
-                const content = await readFile(fullPath, "utf8");
+                let content = await readFile(fullPath, "utf8");
+                
+                // Filter or truncate large files
+                if (shouldFilterFile(filePath, content)) {
+                    if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
+                        content = truncateContent(content, 5000);
+                    } else {
+                        content = truncateContent(content);
+                    }
+                }
+                
                 result[filePath] = { content, operation: fileInfo.operation };
             } catch (err) {
                 console.warn(`Could not read new file from A: ${filePath}`, err.message);
@@ -120,7 +186,17 @@ export const readFilesFromA = async (filesMap) => {
             // For modified/deleted files, we can optionally read from A too
             const fullPath = path.join(repoA, filePath);
             try {
-                const content = await readFile(fullPath, "utf8");
+                let content = await readFile(fullPath, "utf8");
+                
+                // Filter or truncate large files
+                if (shouldFilterFile(filePath, content)) {
+                    if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
+                        content = truncateContent(content, 5000);
+                    } else {
+                        content = truncateContent(content);
+                    }
+                }
+                
                 result[filePath] = { content, operation: fileInfo.operation };
             } catch {
                 result[filePath] = { content: null, operation: fileInfo.operation };
@@ -130,14 +206,54 @@ export const readFilesFromA = async (filesMap) => {
     return result;
 };
 
-export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, commitMessages = []) => {
+// Filter and prioritize files to reduce token usage
+const filterAndPrioritizeFiles = (filesFromA, filesFromB, diffText) => {
+    const filePaths = Object.keys(filesFromA);
+    
+    // If we have too many files, prioritize important ones
+    if (filePaths.length > MAX_FILES_TO_PROCESS) {
+        console.log(`⚠️ Too many files (${filePaths.length}), filtering to most important ${MAX_FILES_TO_PROCESS}...`);
+        
+        // Priority order:
+        // 1. Source code files (not translation files)
+        // 2. Configuration files
+        // 3. Translation files (lowest priority)
+        
+        const prioritized = filePaths
+            .map(filePath => {
+                const priority = 
+                    filePath.includes('/lang/') ? 3 : // Translation files - lowest
+                    (filePath.endsWith('.ts') || filePath.endsWith('.tsx') || 
+                     filePath.endsWith('.js') || filePath.endsWith('.jsx') ||
+                     filePath.endsWith('.py') || filePath.endsWith('.graphql')) ? 1 : // Source code - highest
+                    2; // Other files - medium
+                
+                return { filePath, priority };
+            })
+            .sort((a, b) => a.priority - b.priority)
+            .slice(0, MAX_FILES_TO_PROCESS)
+            .map(item => item.filePath);
+        
+        console.log(`📋 Selected ${prioritized.length} files for processing (skipped ${filePaths.length - prioritized.length} files)`);
+        return prioritized;
+    }
+    
+    return filePaths;
+};
+
+export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, commitMessages = [], retryAttempt = 0) => {
     const repoAUrl = process.env.REPO_A_URL;
     const repoBUrl = process.env.REPO_B_URL;
     const model = process.env.CLAUDE_MODEL || "claude-3-5-sonnet-20241022";
 
-    // Build file information section
+    // Filter files to reduce token usage
+    const selectedFiles = filterAndPrioritizeFiles(filesFromA, filesFromB, diffText);
+    
+    // Build file information section (only for selected files)
     const fileInfoSections = [];
-    for (const filePath of Object.keys(filesFromA)) {
+    let totalEstimatedTokens = estimateTokens(diffText);
+    
+    for (const filePath of selectedFiles) {
         const fileA = filesFromA[filePath];
         const fileB = filesFromB[filePath];
         const operation = fileA.operation || fileB.operation || 'modified';
@@ -177,7 +293,22 @@ ${fileB.content || "(file not found in B)"}
 `;
         }
         
+        totalEstimatedTokens += estimateTokens(section);
         fileInfoSections.push(section);
+    }
+    
+    // Check if we're approaching token limit
+    if (totalEstimatedTokens > MAX_TOKENS_PER_REQUEST) {
+        console.warn(`⚠️ Estimated tokens (${totalEstimatedTokens}) exceeds safe limit (${MAX_TOKENS_PER_REQUEST})`);
+        console.warn(`   Consider reducing MAX_FILES_TO_PROCESS or MAX_FILE_SIZE in environment variables`);
+    }
+
+    // Add note about filtered files if any were skipped
+    let fileNote = '';
+    const allFiles = Object.keys(filesFromA);
+    if (allFiles.length > selectedFiles.length) {
+        const skippedFiles = allFiles.filter(f => !selectedFiles.includes(f));
+        fileNote = `\n\nNOTE: ${skippedFiles.length} file(s) were skipped due to size limits. Please review the git diff for complete changes.\nSkipped files: ${skippedFiles.slice(0, 10).join(', ')}${skippedFiles.length > 10 ? '...' : ''}\n`;
     }
 
     const prompt = `
@@ -193,7 +324,7 @@ ${diffText}
 Detailed file information:
 -------------------------
 ${fileInfoSections.join("\n\n")}
-
+${fileNote}
 Task:
 Generate the best possible Pull Request patch that intelligently merges
 changes from A into B, preserving any custom modifications in B.
@@ -262,13 +393,38 @@ PATCH:
 ---
 `;
 
-    const res = await client.messages.create({
-        model,
-        max_tokens: 16384,
-        messages: [{ role: "user", content: prompt }],
-    });
+    try {
+        const res = await client.messages.create({
+            model,
+            max_tokens: 16384,
+            messages: [{ role: "user", content: prompt }],
+        });
 
-    return res.content[0].text;
+        return res.content[0].text;
+    } catch (error) {
+        // Handle rate limit errors with retry logic
+        if (error.status === 429 && retryAttempt < RETRY_MAX_ATTEMPTS) {
+            const retryAfter = error.headers?.get('retry-after') || 
+                              error.headers?.['retry-after'] || 
+                              String(RETRY_BASE_DELAY_MS / 1000);
+            const delaySeconds = parseInt(retryAfter, 10);
+            const delayMs = delaySeconds * 1000;
+            
+            // Use exponential backoff: delay * (2 ^ retryAttempt)
+            const backoffDelay = delayMs * Math.pow(2, retryAttempt);
+            
+            console.warn(`\n⚠️ Rate limit hit. Waiting ${Math.round(backoffDelay / 1000)} seconds before retry ${retryAttempt + 1}/${RETRY_MAX_ATTEMPTS}...`);
+            console.warn(`   Error: ${error.message}`);
+            
+            await new Promise(resolve => setTimeout(resolve, backoffDelay));
+            
+            // Retry with same parameters
+            return generatePRviaClaude(diffText, filesFromA, filesFromB, commitMessages, retryAttempt + 1);
+        }
+        
+        // Re-throw if not a rate limit error or max retries reached
+        throw error;
+    }
 };
 
 // Parse Claude's response to extract title, description, and patch
