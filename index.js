@@ -6,6 +6,7 @@ import {
   getLatestDiff,
   updateLocalRepositoryA,
   getRepoRoot,
+  getSingleCommitDiff,
 } from "./gitUtils.js";
 import { mergeAndCreatePR } from "./prGenerator.js";
 
@@ -67,7 +68,77 @@ const updateRepository = async () => {
       });
     }
 
-    if (diff && diff.trim().length > 0) {
+    if (commitMessages.length > 0) {
+      console.log(
+        `✅ Found ${commitMessages.length} commit(s) to process`
+      );
+      console.log("→ Processing each commit separately (starting from oldest)...\n");
+
+      // Ensure commits are sorted by date (oldest first)
+      const sortedCommits = [...commitMessages].sort((a, b) => {
+        const dateA = new Date(a.date);
+        const dateB = new Date(b.date);
+        return dateA - dateB; // Oldest first
+      });
+
+      let lastProcessedCommit = localCommit;
+      let allSuccessful = true;
+      let anyPRCreated = false;
+
+      // Process each commit separately (starting from oldest)
+      for (let i = 0; i < sortedCommits.length; i++) {
+        const commit = sortedCommits[i];
+        const commit = commitMessages[i];
+        console.log(`\n📦 Processing commit ${i + 1}/${commitMessages.length}: ${commit.hash.substring(0, 7)}`);
+        console.log(`   Message: ${commit.message.split('\n')[0]}`);
+
+        try {
+          // Get diff for this single commit
+          const commitDiff = await getSingleCommitDiff(git, commit.hash);
+          
+          if (!commitDiff || commitDiff.trim().length === 0) {
+            console.log(`   ⚠️ No changes found in this commit, skipping...`);
+            lastProcessedCommit = commit.hash;
+            continue;
+          }
+
+          // Process this single commit
+          const result = await mergeAndCreatePR(commitDiff, commit.hash, [commit]);
+
+          if (result.success) {
+            if (result.prUrl) {
+              console.log(`   ✅ PR created successfully: ${result.prUrl}`);
+              anyPRCreated = true;
+              lastProcessedCommit = commit.hash;
+            } else {
+              console.log(`   ℹ️ No PR created (no changes after merge)`);
+              lastProcessedCommit = commit.hash;
+            }
+          } else {
+            console.error(`   ❌ Failed to create PR: ${result.reason || result.error}`);
+            console.error(`\n🛑 Stopping processing due to error. Remaining commits will not be processed.`);
+            allSuccessful = false;
+            break; // Stop processing remaining commits
+          }
+        } catch (err) {
+          console.error(`   ❌ Error processing commit ${commit.hash.substring(0, 7)}:`, err.message);
+          console.error(`\n🛑 Stopping processing due to error. Remaining commits will not be processed.`);
+          allSuccessful = false;
+          break; // Stop processing remaining commits
+        }
+      }
+
+      // After processing all commits, update local Repository A
+      if (allSuccessful && lastProcessedCommit && lastProcessedCommit !== localCommit) {
+        console.log(`\n🔄 Updating local Repository A to latest processed commit...`);
+        await updateLocalRepositoryA(git, repoABranch);
+      } else if (anyPRCreated) {
+        // Even if some failed, update if at least one PR was created
+        console.log(`\n🔄 Updating local Repository A...`);
+        await updateLocalRepositoryA(git, repoABranch);
+      }
+    } else if (diff && diff.trim().length > 0) {
+      // Fallback: if we have diff but no commit messages, process as before
       console.log(
         `✅ Differences found between local and remote A`
       );

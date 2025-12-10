@@ -158,6 +158,37 @@ export const getLatestDiff = async (git, branch) => {
   }
 };
 
+// Get diff for a single commit
+// Returns the diff between commit^ (parent) and commit
+export const getSingleCommitDiff = async (git, commitHash) => {
+  try {
+    // Get diff between parent and commit
+    // Format: commit^..commit shows changes introduced by this commit
+    const diff = await git.diff([
+      `${commitHash}^`,
+      commitHash,
+      "--diff-filter=ACDMRT", // Include Added, Copied, Deleted, Modified, Renamed, Type-changed files
+      "--unified=3" // More context lines
+    ]);
+    
+    return diff;
+  } catch (err) {
+    // If commit^ doesn't exist (e.g., first commit), try to get diff from empty tree
+    try {
+      const diff = await git.diff([
+        "--root",
+        commitHash,
+        "--diff-filter=ACDMRT",
+        "--unified=3"
+      ]);
+      return diff;
+    } catch (fallbackErr) {
+      console.error(`Error getting diff for commit ${commitHash}:`, err.message);
+      return "";
+    }
+  }
+};
+
 // Update local repository A to match remote A (after successful PR creation)
 export const updateLocalRepositoryA = async (git, branch) => {
   try {
