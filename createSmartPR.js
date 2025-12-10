@@ -23,11 +23,10 @@ const estimateTokens = (text) => {
     return Math.ceil(text.length / 3.5);
 };
 
-// Check if file should be filtered (e.g., large translation files)
-const shouldFilterFile = (filePath, content) => {
-    // Filter out very large translation JSON files (they're often repetitive)
-    if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
-        // For translation files, we'll truncate them significantly
+// Check if file should be truncated (e.g., large files)
+const shouldTruncateFile = (filePath, content) => {
+    // Always truncate very large files (over MAX_FILE_SIZE)
+    if (content && content.length > MAX_FILE_SIZE) {
         return true;
     }
     // Filter out node_modules, build artifacts, etc.
@@ -136,14 +135,14 @@ export const readFilesFromB = async (filesMap) => {
         try {
             let content = await readFile(fullPath, "utf8");
             
-            // Filter or truncate large files
-            if (shouldFilterFile(filePath, content)) {
-                // For translation files, only keep a sample
+            // Truncate large files
+            if (shouldTruncateFile(filePath, content)) {
+                // For translation files, keep only first 5000 chars
                 if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
-                    // Keep only first 5000 chars for translation files
                     content = truncateContent(content, 5000);
                 } else {
-                    content = truncateContent(content);
+                    // For other large files, truncate to MAX_FILE_SIZE
+                    content = truncateContent(content, MAX_FILE_SIZE);
                 }
             }
             
@@ -168,12 +167,14 @@ export const readFilesFromA = async (filesMap) => {
             try {
                 let content = await readFile(fullPath, "utf8");
                 
-                // Filter or truncate large files
-                if (shouldFilterFile(filePath, content)) {
+                // Truncate large files
+                if (shouldTruncateFile(filePath, content)) {
+                    // For translation files, keep only first 5000 chars
                     if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
                         content = truncateContent(content, 5000);
                     } else {
-                        content = truncateContent(content);
+                        // For other large files, truncate to MAX_FILE_SIZE
+                        content = truncateContent(content, MAX_FILE_SIZE);
                     }
                 }
                 
@@ -188,12 +189,14 @@ export const readFilesFromA = async (filesMap) => {
             try {
                 let content = await readFile(fullPath, "utf8");
                 
-                // Filter or truncate large files
-                if (shouldFilterFile(filePath, content)) {
+                // Truncate large files
+                if (shouldTruncateFile(filePath, content)) {
+                    // For translation files, keep only first 5000 chars
                     if (filePath.includes('/lang/') && filePath.endsWith('.json')) {
                         content = truncateContent(content, 5000);
                     } else {
-                        content = truncateContent(content);
+                        // For other large files, truncate to MAX_FILE_SIZE
+                        content = truncateContent(content, MAX_FILE_SIZE);
                     }
                 }
                 
@@ -209,6 +212,57 @@ export const readFilesFromA = async (filesMap) => {
 // Check if file is a translation file
 const isTranslationFile = (filePath) => {
     return filePath.includes('/lang/') && filePath.endsWith('.json');
+};
+
+// Filter translation files BEFORE reading them (to save memory and tokens)
+export const filterTranslationFilesBeforeReading = (filesMap) => {
+    const translationFiles = new Map(); // category -> [{ filePath, language, fileInfo }]
+    const nonTranslationFiles = new Map();
+    const filteredTranslationFiles = new Map();
+    const skippedTranslationFiles = [];
+    
+    // Separate translation files from others
+    for (const [filePath, fileInfo] of filesMap.entries()) {
+        const info = getTranslationFileInfo(filePath);
+        if (info) {
+            // Group by category (back/front)
+            if (!translationFiles.has(info.category)) {
+                translationFiles.set(info.category, []);
+            }
+            translationFiles.get(info.category).push({ ...info, fileInfo });
+        } else {
+            nonTranslationFiles.set(filePath, fileInfo);
+        }
+    }
+    
+    // For each category, keep only one sample (prefer 'en.json' if available, otherwise first one)
+    for (const [category, files] of translationFiles.entries()) {
+        // Sort: prefer 'en.json', then alphabetically
+        files.sort((a, b) => {
+            if (a.language === 'en') return -1;
+            if (b.language === 'en') return 1;
+            return a.language.localeCompare(b.language);
+        });
+        
+        // Keep only the first one (preferred sample)
+        const sample = files[0];
+        filteredTranslationFiles.set(sample.filePath, sample.fileInfo);
+        
+        // Collect skipped files
+        if (files.length > 1) {
+            const skipped = files.slice(1).map(f => f.language).join(', ');
+            skippedTranslationFiles.push(...files.slice(1).map(f => f.filePath));
+            console.log(`   📝 Translation files (${category}): Keeping ${sample.language}.json, skipping ${files.length - 1} other(s): ${skipped}`);
+        }
+    }
+    
+    // Combine non-translation files with filtered translation files
+    const filteredMap = new Map([...nonTranslationFiles, ...filteredTranslationFiles]);
+    
+    return {
+        filteredMap,
+        skippedTranslationFiles
+    };
 };
 
 // Get translation file category (front/back) and language code
@@ -324,13 +378,18 @@ const filterAndPrioritizeFiles = (filesFromA, filesFromB, diffText) => {
     return { selected: filesAfterTranslationFilter, skippedTranslationFiles };
 };
 
-export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, commitMessages = [], retryAttempt = 0) => {
+export const generatePRviaClaude = async (diffText, filesFromA, filesFromB, commitMessages = [], retryAttempt = 0, skippedTranslationFilesFromCaller = []) => {
     const repoAUrl = process.env.REPO_A_URL;
     const repoBUrl = process.env.REPO_B_URL;
     const model = process.env.CLAUDE_MODEL || "claude-3-5-sonnet-20241022";
 
-    // Filter files to reduce token usage
-    const { selected: selectedFiles, skippedTranslationFiles } = filterAndPrioritizeFiles(filesFromA, filesFromB, diffText);
+    // Filter files to reduce token usage (if not already filtered)
+    const { selected: selectedFiles, skippedTranslationFiles: skippedFromFilter } = filterAndPrioritizeFiles(filesFromA, filesFromB, diffText);
+    
+    // Use skippedTranslationFiles from caller if provided, otherwise use from filter
+    const skippedTranslationFiles = skippedTranslationFilesFromCaller.length > 0 
+        ? skippedTranslationFilesFromCaller 
+        : skippedFromFilter;
     
     // Build file information section (only for selected files)
     const fileInfoSections = [];

@@ -6,6 +6,7 @@ import {
     generatePRviaClaude,
     parseClaudeResponse,
     createPRonGitHub,
+    filterTranslationFilesBeforeReading,
 } from "./createSmartPR.js";
 
 /**
@@ -35,15 +36,30 @@ export const mergeAndCreatePR = async (diffText, latestCommit, commitMessages = 
             console.log(`  - ${filePath} (${fileInfo.operation})`);
         }
 
-        console.log("Reading files from Repository A...");
-        const filesFromA = await readFilesFromA(changedFilesMap);
+        // Filter translation files BEFORE reading to save memory and tokens
+        const { filteredMap: filteredFilesMap, skippedTranslationFiles } = filterTranslationFilesBeforeReading(changedFilesMap);
+        
+        if (skippedTranslationFiles.length > 0) {
+            console.log(`🌐 Filtered ${skippedTranslationFiles.length} translation file(s) BEFORE reading - keeping only 1 sample per category (front/back)`);
+        }
 
-        console.log("Reading files from Repository B...");
-        const filesFromB = await readFilesFromB(changedFilesMap);
+        console.log(`Reading ${filteredFilesMap.size} file(s) from Repository A...`);
+        const filesFromA = await readFilesFromA(filteredFilesMap);
+
+        console.log(`Reading ${filteredFilesMap.size} file(s) from Repository B...`);
+        const filesFromB = await readFilesFromB(filteredFilesMap);
 
         console.log("Sending to Claude for intelligent merge...");
-        console.log(`📊 Estimated token usage: ~${Math.ceil((diffText.length + JSON.stringify(filesFromA).length + JSON.stringify(filesFromB).length) / 3.5)} tokens`);
-        const claudeResponse = await generatePRviaClaude(diffText, filesFromA, filesFromB, commitMessages);
+        // More accurate token estimation based on actual content
+        let estimatedTokens = Math.ceil(diffText.length / 3.5);
+        for (const filePath of Object.keys(filesFromA)) {
+            const fileA = filesFromA[filePath];
+            const fileB = filesFromB[filePath];
+            if (fileA?.content) estimatedTokens += Math.ceil(fileA.content.length / 3.5);
+            if (fileB?.content) estimatedTokens += Math.ceil(fileB.content.length / 3.5);
+        }
+        console.log(`📊 Estimated token usage: ~${estimatedTokens} tokens`);
+        const claudeResponse = await generatePRviaClaude(diffText, filesFromA, filesFromB, commitMessages, 0, skippedTranslationFiles);
 
         console.log("Parsing Claude response...");
         let { title, description, patch } = parseClaudeResponse(claudeResponse);
@@ -118,57 +134,52 @@ export const mergeAndCreatePR = async (diffText, latestCommit, commitMessages = 
         };
         
         // Add note about translation files if any were filtered
-        const translationFiles = Array.from(changedFilesMap.keys()).filter(filePath => 
-            filePath.includes('/lang/') && filePath.endsWith('.json')
-        );
-        
-        if (translationFiles.length > 0) {
-            // Group by category (front/back)
+        if (skippedTranslationFiles && skippedTranslationFiles.length > 0) {
+            // Group skipped translation files by category
             const byCategory = {};
-            for (const filePath of translationFiles) {
+            for (const filePath of skippedTranslationFiles) {
                 const match = filePath.match(/\/lang\/(back|front)\/([^\/]+)\.json$/);
                 if (match) {
                     const category = match[1];
                     const language = match[2];
                     if (!byCategory[category]) {
-                        byCategory[category] = [];
+                        byCategory[category] = { included: null, skipped: [] };
                     }
-                    byCategory[category].push({ filePath, language });
+                    byCategory[category].skipped.push(language);
                 }
             }
             
-            // Check if we have multiple languages per category (meaning some were filtered)
-            let hasFiltered = false;
-            for (const [category, files] of Object.entries(byCategory)) {
-                if (files.length > 1) {
-                    hasFiltered = true;
-                    break;
+            // Find which files were included (from filteredFilesMap)
+            const includedTranslationFiles = Array.from(filteredFilesMap.keys()).filter(filePath => 
+                filePath.includes('/lang/') && filePath.endsWith('.json')
+            );
+            
+            for (const filePath of includedTranslationFiles) {
+                const match = filePath.match(/\/lang\/(back|front)\/([^\/]+)\.json$/);
+                if (match) {
+                    const category = match[1];
+                    const language = match[2];
+                    if (!byCategory[category]) {
+                        byCategory[category] = { included: null, skipped: [] };
+                    }
+                    byCategory[category].included = language;
                 }
             }
             
-            if (hasFiltered) {
-                description += `\n\n---\n\n## 🌐 Translation Files Note\n\n`;
-                description += `This PR includes changes to translation files. `;
-                description += `Only one sample file per category (frontend/backend) was processed by the AI to reduce token usage.\n\n`;
-                description += `**Please apply the same changes to all other language files:**\n\n`;
-                
-                for (const [category, files] of Object.entries(byCategory)) {
-                    if (files.length > 1) {
-                        // Sort to find the sample (prefer 'en')
-                        files.sort((a, b) => {
-                            if (a.language === 'en') return -1;
-                            if (b.language === 'en') return 1;
-                            return a.language.localeCompare(b.language);
-                        });
-                        
-                        const sample = files[0];
-                        const others = files.slice(1).map(f => f.language).join(', ');
-                        description += `- **${category}/**: Sample file \`${sample.language}.json\` included. Apply same changes to: \`${others}\`\n`;
-                    }
+            description += `\n\n---\n\n## 🌐 Translation Files Note\n\n`;
+            description += `This PR includes changes to translation files. `;
+            description += `Only one sample file per category (frontend/backend) was processed by the AI to reduce token usage.\n\n`;
+            description += `**Please apply the same changes to all other language files:**\n\n`;
+            
+            for (const [category, info] of Object.entries(byCategory)) {
+                if (info.skipped.length > 0) {
+                    const included = info.included || 'en';
+                    const others = info.skipped.join(', ');
+                    description += `- **${category}/**: Sample file \`${included}.json\` included. Apply same changes to: \`${others}\`\n`;
                 }
-                
-                description += `\nYou can review the git diff to see all translation file changes and apply them manually to other languages.\n`;
             }
+            
+            description += `\nYou can review the git diff to see all translation file changes and apply them manually to other languages.\n`;
         }
         
         // Enhance description with commit messages from Repository A
