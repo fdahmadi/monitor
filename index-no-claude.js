@@ -8,13 +8,16 @@ import {
   resetLocalToCommit,
   getRepoRoot,
   getSingleCommitDiff,
+  getNextCommit,
+  getCurrentLocalCommit,
+  getNextCommitFromRemote,
 } from "./gitUtils.js";
 import { mergeAndCreatePRNoClaude } from "./prGeneratorNoClaude.js";
 
 // Handle both absolute and relative paths for REPO_A_PATH
 const repoAPathRaw = process.env.REPO_A_PATH;
-const repoAPath = path.isAbsolute(repoAPathRaw) 
-  ? repoAPathRaw 
+const repoAPath = path.isAbsolute(repoAPathRaw)
+  ? repoAPathRaw
   : path.resolve(process.cwd(), repoAPathRaw);
 const repoABranch = process.env.REPO_A_BRANCH || "main";
 
@@ -48,12 +51,21 @@ const updateRepository = async () => {
 
     const git = createGit(repoAPath);
     const repoRoot = await getRepoRoot(git);
-
+    let currentLocalCommit = await getCurrentLocalCommit(git);
+    let nextCommit = await getNextCommitFromRemote(
+      git,
+      currentLocalCommit,
+      repoABranch
+    );
+    if (nextCommit) {
+      console.log(`Next commit: ${nextCommit.substring(0, 7)}`);
+    }
     if (repoRoot) {
       console.log(`Repo Root: ${repoRoot}`);
     }
 
-    const { diff, latestCommit, localCommit, commitMessages } = await getLatestDiff(git, repoABranch);
+    const { diff, latestCommit, localCommit, commitMessages } =
+      await getLatestDiff(git, repoABranch);
 
     if (!latestCommit) {
       console.log("⚠️ Could not determine latest commit from remote");
@@ -68,15 +80,19 @@ const updateRepository = async () => {
     if (commitMessages.length > 0) {
       console.log(`📝 Commit messages from Repository A:`);
       commitMessages.forEach((commit, idx) => {
-        console.log(`  ${idx + 1}. [${commit.hash.substring(0, 7)}] ${commit.message.split('\n')[0]}`);
+        console.log(
+          `  ${idx + 1}. [${commit.hash.substring(0, 7)}] ${
+            commit.message.split("\n")[0]
+          }`
+        );
       });
     }
 
     if (commitMessages.length > 0) {
+      console.log(`✅ Found ${commitMessages.length} commit(s) to process`);
       console.log(
-        `✅ Found ${commitMessages.length} commit(s) to process`
+        "→ Processing each commit separately (starting from oldest)...\n"
       );
-      console.log("→ Processing each commit separately (starting from oldest)...\n");
 
       // Ensure commits are sorted by date (oldest first)
       const sortedCommits = [...commitMessages].sort((a, b) => {
@@ -92,29 +108,41 @@ const updateRepository = async () => {
       // Process each commit separately (starting from oldest)
       for (let i = 0; i < sortedCommits.length; i++) {
         const commit = sortedCommits[i];
-        console.log(`\n📦 Processing commit ${i + 1}/${sortedCommits.length}: ${commit.hash.substring(0, 7)}`);
-        console.log(`   Message: ${commit.message.split('\n')[0]}`);
+        console.log(
+          `\n📦 Processing commit ${i + 1}/${
+            sortedCommits.length
+          }: ${commit.hash.substring(0, 7)}`
+        );
+        console.log(`   Message: ${commit.message.split("\n")[0]}`);
 
         try {
           // Get diff for this single commit
           const commitDiff = await getSingleCommitDiff(git, commit.hash);
-          
+
           if (!commitDiff || commitDiff.trim().length === 0) {
             console.log(`   ⚠️ No changes found in this commit, skipping...`);
             lastProcessedCommit = commit.hash;
             // Reset local repo A to this commit after skipping to prevent reprocessing
             await resetLocalToCommit(git, repoABranch, commit.hash);
-            
+
             // Wait before processing next commit (if there is one)
             if (i < sortedCommits.length - 1) {
-              console.log(`   ⏳ Waiting ${commitWaitTimeMinutes} minute(s) before processing next commit...`);
-              await new Promise(resolve => setTimeout(resolve, commitWaitTimeMs));
+              console.log(
+                `   ⏳ Waiting ${commitWaitTimeMinutes} minute(s) before processing next commit...`
+              );
+              await new Promise((resolve) =>
+                setTimeout(resolve, commitWaitTimeMs)
+              );
             }
             continue;
           }
 
           // Process this single commit (WITHOUT Claude)
-          const result = await mergeAndCreatePRNoClaude(commitDiff, commit.hash, [commit]);
+          const result = await mergeAndCreatePRNoClaude(
+            commitDiff,
+            commit.hash,
+            [commit]
+          );
 
           if (result.success) {
             if (result.prUrl) {
@@ -124,64 +152,100 @@ const updateRepository = async () => {
               console.log(`   ℹ️ No PR created (no changes after merge)`);
             }
             lastProcessedCommit = commit.hash;
-            
+
             // Reset local repo A to this commit after successful processing to prevent reprocessing
-            console.log(`   🔄 Resetting local Repository A to commit ${commit.hash.substring(0, 7)}...`);
+            console.log(
+              `   🔄 Resetting local Repository A to commit ${commit.hash.substring(
+                0,
+                7
+              )}...`
+            );
             await resetLocalToCommit(git, repoABranch, commit.hash);
-            
+
             // Wait before processing next commit (if there is one)
             if (i < sortedCommits.length - 1) {
-              console.log(`   ⏳ Waiting ${commitWaitTimeMinutes} minute(s) before processing next commit...`);
-              await new Promise(resolve => setTimeout(resolve, commitWaitTimeMs));
+              console.log(
+                `   ⏳ Waiting ${commitWaitTimeMinutes} minute(s) before processing next commit...`
+              );
+              await new Promise((resolve) =>
+                setTimeout(resolve, commitWaitTimeMs)
+              );
             }
           } else {
             // Check if it's a conflict error
             if (result.reason === "File conflicts with open PRs") {
-              console.error(`   ❌ File conflicts detected with open pull requests.`);
+              console.error(
+                `   ❌ File conflicts detected with open pull requests.`
+              );
               if (result.conflictingPRs) {
                 console.error(`   Conflicting PRs:`);
-                result.conflictingPRs.forEach(conflict => {
-                  console.error(`     - PR #${conflict.prNumber}: ${conflict.prTitle} (${conflict.prUrl})`);
-                  console.error(`       Files: ${conflict.conflictingFiles.join(', ')}`);
+                result.conflictingPRs.forEach((conflict) => {
+                  console.error(
+                    `     - PR #${conflict.prNumber}: ${conflict.prTitle} (${conflict.prUrl})`
+                  );
+                  console.error(
+                    `       Files: ${conflict.conflictingFiles.join(", ")}`
+                  );
                 });
               }
             } else {
-              console.error(`   ❌ Failed to create PR: ${result.reason || result.error}`);
+              console.error(
+                `   ❌ Failed to create PR: ${result.reason || result.error}`
+              );
             }
-            console.error(`\n🛑 Stopping processing due to error. Remaining commits will not be processed.`);
+            console.error(
+              `\n🛑 Stopping processing due to error. Remaining commits will not be processed.`
+            );
             allSuccessful = false;
             break; // Stop processing remaining commits
           }
         } catch (err) {
-          console.error(`   ❌ Error processing commit ${commit.hash.substring(0, 7)}:`, err.message);
-          console.error(`\n🛑 Stopping processing due to error. Remaining commits will not be processed.`);
+          console.error(
+            `   ❌ Error processing commit ${commit.hash.substring(0, 7)}:`,
+            err.message
+          );
+          console.error(
+            `\n🛑 Stopping processing due to error. Remaining commits will not be processed.`
+          );
           allSuccessful = false;
           break; // Stop processing remaining commits
         }
       }
 
       // Final update check (shouldn't be needed since we update after each commit, but keeping as safety net)
-      if (allSuccessful && lastProcessedCommit && lastProcessedCommit !== localCommit) {
-        console.log(`\n🔄 Final sync: Updating local Repository A to latest processed commit...`);
+      if (
+        allSuccessful &&
+        lastProcessedCommit &&
+        lastProcessedCommit !== localCommit
+      ) {
+        console.log(
+          `\n🔄 Final sync: Updating local Repository A to latest processed commit...`
+        );
         await updateLocalRepositoryA(git, repoABranch);
-      } else if (anyPRCreated && lastProcessedCommit && lastProcessedCommit !== localCommit) {
+      } else if (
+        anyPRCreated &&
+        lastProcessedCommit &&
+        lastProcessedCommit !== localCommit
+      ) {
         // Even if some failed, update if at least one PR was created (safety net)
         console.log(`\n🔄 Final sync: Updating local Repository A...`);
         await updateLocalRepositoryA(git, repoABranch);
       }
     } else if (diff && diff.trim().length > 0) {
       // Fallback: if we have diff but no commit messages, process as before
-      console.log(
-        `✅ Differences found between local and remote A`
-      );
+      console.log(`✅ Differences found between local and remote A`);
       console.log("→ Running PR logic (No Claude)...");
 
-      const result = await mergeAndCreatePRNoClaude(diff, latestCommit, commitMessages);
+      const result = await mergeAndCreatePRNoClaude(
+        diff,
+        latestCommit,
+        commitMessages
+      );
 
       if (result.success) {
         if (result.prUrl) {
           console.log(`\n🎉 PR created successfully: ${result.prUrl}`);
-          
+
           // After successful PR creation, update local Repository A
           // to sync with remote A for next check
           await updateLocalRepositoryA(git, repoABranch);
@@ -196,12 +260,18 @@ const updateRepository = async () => {
       } else {
         // Check if it's a conflict error
         if (result.reason === "File conflicts with open PRs") {
-          console.error(`\n❌ File conflicts detected with open pull requests.`);
+          console.error(
+            `\n❌ File conflicts detected with open pull requests.`
+          );
           if (result.conflictingPRs) {
             console.error(`Conflicting PRs:`);
-            result.conflictingPRs.forEach(conflict => {
-              console.error(`  - PR #${conflict.prNumber}: ${conflict.prTitle} (${conflict.prUrl})`);
-              console.error(`    Files: ${conflict.conflictingFiles.join(', ')}`);
+            result.conflictingPRs.forEach((conflict) => {
+              console.error(
+                `  - PR #${conflict.prNumber}: ${conflict.prTitle} (${conflict.prUrl})`
+              );
+              console.error(
+                `    Files: ${conflict.conflictingFiles.join(", ")}`
+              );
             });
           }
         } else {
@@ -210,11 +280,15 @@ const updateRepository = async () => {
         // Don't update local A if PR creation failed
       }
     } else {
-      console.log("ℹ️ No new changes detected (local A is up to date with remote A).");
-      
+      console.log(
+        "ℹ️ No new changes detected (local A is up to date with remote A)."
+      );
+
       // Even if no diff, check if we need to sync
       if (localCommit !== latestCommit) {
-        console.log("⚠️ Local and remote commits differ but no diff found. Updating local A...");
+        console.log(
+          "⚠️ Local and remote commits differ but no diff found. Updating local A..."
+        );
         await updateLocalRepositoryA(git, repoABranch);
       }
     }
@@ -237,24 +311,29 @@ updateRepository();
 // Cron expression: 0 * * * * means "at minute 0 of every hour"
 const cronSchedule = process.env.CRON_SCHEDULE || "0 * * * *";
 
-const task = cron.schedule(cronSchedule, () => {
-  console.log(`\n⏰ Scheduled check triggered at ${new Date().toISOString()}`);
-  updateRepository();
-}, {
-  scheduled: true,
-  timezone: "UTC"
-});
+const task = cron.schedule(
+  cronSchedule,
+  () => {
+    console.log(
+      `\n⏰ Scheduled check triggered at ${new Date().toISOString()}`
+    );
+    updateRepository();
+  },
+  {
+    scheduled: true,
+    timezone: "UTC",
+  }
+);
 
 // Handle graceful shutdown
-process.on('SIGINT', () => {
-  console.log('\n🛑 Shutting down gracefully...');
+process.on("SIGINT", () => {
+  console.log("\n🛑 Shutting down gracefully...");
   task.stop();
   process.exit(0);
 });
 
-process.on('SIGTERM', () => {
-  console.log('\n🛑 Shutting down gracefully...');
+process.on("SIGTERM", () => {
+  console.log("\n🛑 Shutting down gracefully...");
   task.stop();
   process.exit(0);
 });
-
