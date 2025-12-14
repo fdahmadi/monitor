@@ -4,7 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node test.js",
+    "start:optimized": "node test-optimized.js",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "test": "node --test test/**/*.test.js",
+    "test:watch": "node --test --watch test/**/*.test.js"
   },
   "keywords": [],
   "author": "",
@@ -19,5 +24,8 @@
     "node-cron": "^3.0.3",
     "nodemailer": "^7.0.11",
     "simple-git": "^3.30.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.0"
   }
 }
